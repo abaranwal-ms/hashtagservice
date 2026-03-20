@@ -1,4 +1,4 @@
-# HashtagService — Event Hubs Infrastructure (`infra/`)
+# HashtagService — Event Hubs Infrastructure (`infra/kafka/`)
 
 Bicep templates that provision every Azure resource required by the HashtagService
 messaging layer (Azure Event Hubs + Azure Blob Storage for checkpoints) and wire up
@@ -10,15 +10,16 @@ RBAC so that `DefaultAzureCredential` works from day one—no connection strings
 
 ```
 infra/
-├── main.bicep                   # Root orchestrator; imports the three modules
-├── deploy.sh                    # End-to-end deploy + appsettings.json patcher
-├── parameters/
-│   └── dev.bicepparam           # Parameter values for the dev/learning environment
-├── modules/
-│   ├── eventhubs.bicep          # Namespace, topics, consumer groups
-│   ├── storage.bicep            # Storage account + checkpoint containers
-│   └── rbac.bicep               # RBAC role assignments
-└── README.md                    # This file
+└── kafka/
+    ├── main.bicep                   # Root orchestrator; imports the three modules
+    ├── deploy.ps1                   # End-to-end deploy + appsettings.json patcher (PowerShell 7+)
+    ├── parameters/
+    │   └── dev.bicepparam           # Parameter values for the dev/learning environment
+    ├── modules/
+    │   ├── eventhubs.bicep          # Namespace, topics, consumer groups
+    │   ├── storage.bicep            # Storage account + checkpoint containers
+    │   └── rbac.bicep               # RBAC role assignments
+    └── README.md                    # This file
 ```
 
 ---
@@ -44,12 +45,12 @@ infra/
 | Tool | Minimum version | Install |
 |---|---|---|
 | Azure CLI | 2.55 | https://aka.ms/installazurecli |
-| Python 3 | 3.8 | (used only by `deploy.sh` to patch `appsettings.json`) |
+| PowerShell | 7.0 | https://aka.ms/install-powershell |
 | Bicep (bundled with az) | 0.25 | `az bicep upgrade` |
 
 Authenticate before running:
 
-```bash
+```powershell
 az login
 ```
 
@@ -57,9 +58,9 @@ az login
 
 ## Quick start
 
-```bash
-cd infra
-./deploy.sh
+```powershell
+cd infra/kafka
+pwsh ./deploy.ps1
 ```
 
 That's it. The script will:
@@ -71,21 +72,27 @@ That's it. The script will:
 5. Read the deployment outputs
 6. Patch `EventHub:Namespace` and `CheckpointStorage:BlobUri` in all three `appsettings.json` files
 
-### Environment-variable overrides
+### Parameter overrides
 
-| Variable | Default | Purpose |
+| Parameter | Default | Purpose |
 |---|---|---|
-| `SUBSCRIPTION_ID` | `67e53100-…` | Target subscription |
-| `RESOURCE_GROUP` | `hashtagservice` | Target resource group |
-| `LOCATION` | `southindia` | Azure region |
-| `PRINCIPAL_ID` | *(auto-detected)* | Skip `az ad signed-in-user show`; use a fixed principal |
-| `PRINCIPAL_TYPE` | `User` | `User` / `ServicePrincipal` / `Group` |
+| `-SubscriptionId` | `67e53100-…` | Target subscription |
+| `-ResourceGroup` | `hashtagservice` | Target resource group |
+| `-Location` | `southindia` | Azure region |
+| `-PrincipalId` | *(auto-detected)* | Skip `az ad signed-in-user show`; use a fixed principal |
+| `-PrincipalType` | `User` | `User` / `ServicePrincipal` / `Group` |
+
+Example with overrides:
+
+```powershell
+pwsh ./deploy.ps1 -ResourceGroup my-rg -Location westeurope
+```
 
 ---
 
-## Manual deployment (without deploy.sh)
+## Manual deployment (without deploy.ps1)
 
-```bash
+```powershell
 # 1. Set subscription
 az account set --subscription 67e53100-61d9-49b5-8176-ad06015325bf
 
@@ -93,26 +100,26 @@ az account set --subscription 67e53100-61d9-49b5-8176-ad06015325bf
 az group create --name hashtagservice --location southindia
 
 # 3. Get your principal ID
-MY_ID=$(az ad signed-in-user show --query id -o tsv)
+$MY_ID = (az ad signed-in-user show --query id -o tsv)
 
 # 4. Deploy
-az deployment group create \
-  --name           hashtagservice-infra \
-  --resource-group hashtagservice \
-  --template-file  infra/main.bicep \
-  --parameters     infra/parameters/dev.bicepparam \
-  --parameters     principalId="$MY_ID" principalType="User"
+az deployment group create `
+  --name           hashtagservice-infra `
+  --resource-group hashtagservice `
+  --template-file  infra/kafka/main.bicep `
+  --parameters     infra/kafka/parameters/dev.bicepparam `
+  --parameters     "principalId=$MY_ID" principalType=User
 
 # 5. Read outputs
-az deployment group show \
-  --name hashtagservice-infra \
-  --resource-group hashtagservice \
+az deployment group show `
+  --name hashtagservice-infra `
+  --resource-group hashtagservice `
   --query properties.outputs
 ```
 
 ---
 
-## appsettings.json values set by deploy.sh
+## appsettings.json values set by deploy.ps1
 
 After a successful deploy the script updates:
 

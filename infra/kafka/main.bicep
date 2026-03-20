@@ -19,7 +19,7 @@
 //   Module rbac       → Role: Azure Event Hubs Data Owner        → EH namespace
 //                        Role: Storage Blob Data Contributor      → storage account
 //
-// Deploy via:  cd infra && ./deploy.sh
+// Deploy via:  cd infra/kafka && pwsh ./deploy.ps1
 // ─────────────────────────────────────────────────────────────────────────────
 
 targetScope = 'resourceGroup'
