@@ -57,6 +57,7 @@ resource container 'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/container
         includedPaths: [
           { path: '/hashtag/?' }
           { path: '/totalPostCount/?' }
+          { path: '/isDeleted/?' }
         ]
         excludedPaths: [
           { path: '/*' }
@@ -85,6 +86,7 @@ resource postsContainer 'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/cont
         includedPaths: [
           { path: '/userId/?' }
           { path: '/createdAt/?' }
+          { path: '/isDeleted/?' }
         ]
         excludedPaths: [
           { path: '/*' }

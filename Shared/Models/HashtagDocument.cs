@@ -26,6 +26,14 @@ public class HashtagDocument
     /// <summary>Total number of posts that used this hashtag (not capped).</summary>
     [JsonPropertyName("totalPostCount")]
     public long TotalPostCount { get; set; }
+
+    /// <summary>Soft-delete flag. When true the document is logically deleted.</summary>
+    [JsonPropertyName("isDeleted")]
+    public bool IsDeleted { get; set; }
+
+    /// <summary>UTC timestamp of when the document was soft-deleted. Null if not deleted.</summary>
+    [JsonPropertyName("deletedAt")]
+    public DateTimeOffset? DeletedAt { get; set; }
 }
 
 /// <summary>

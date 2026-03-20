@@ -58,12 +58,16 @@ Model: `Shared/Models/HashtagDocument.cs`
     { "postId": "3fa85f64-5717-4562-b3fc-2c963f66afa6", "imageUrl": "https://cdn.example.com/img/abc123.jpg" },
     { "postId": "b2c4e8a1-1234-5678-9abc-def012345678", "imageUrl": "https://cdn.example.com/img/xyz789.jpg" }
   ],
-  "totalPostCount": 1542
+  "totalPostCount": 1542,
+  "isDeleted": false,
+  "deletedAt": null
 }
 ```
 
 - `topPosts` — capped at 100 most recent post references (postId + imageUrl)
 - `totalPostCount` — total posts using this hashtag (not capped)
+- `isDeleted` — soft-delete flag; `false` by default, set to `true` on logical deletion
+- `deletedAt` — UTC timestamp of soft deletion; `null` when not deleted
 
 **Partition key choice: `/hashtag`**
 - ✅ Point read by hashtag = 1 RU (id == hashtag)
@@ -80,7 +84,9 @@ Model: `Shared/Models/PostDocument.cs`
   "userId": "user42",
   "url": "https://cdn.example.com/img/abc123.jpg",
   "text": "Check out this #sunset over the #mountains",
-  "createdAt": "2026-03-21T12:00:00Z"
+  "createdAt": "2026-03-21T12:00:00Z",
+  "isDeleted": false,
+  "deletedAt": null
 }
 ```
 
@@ -88,6 +94,10 @@ Model: `Shared/Models/PostDocument.cs`
 - ✅ Point read by post ID = 1 RU
 - ✅ Perfect write distribution — every post on its own partition
 - ✅ Simplest design — no synthetic keys
+
+**Soft delete fields**
+- `isDeleted` — `false` by default; set to `true` when the post is logically deleted
+- `deletedAt` — UTC timestamp of deletion; `null` when active
 
 ### Document Schema — `UserPartitions` Container *(TODO)*
 
@@ -200,7 +210,8 @@ var trendingQuery = new QueryDefinition(
   "indexingMode": "consistent",
   "includedPaths": [
     { "path": "/hashtag/?" },
-    { "path": "/totalPostCount/?" }
+    { "path": "/totalPostCount/?" },
+    { "path": "/isDeleted/?" }
   ],
   "excludedPaths": [
     { "path": "/*" }
@@ -214,13 +225,131 @@ var trendingQuery = new QueryDefinition(
   "indexingMode": "consistent",
   "includedPaths": [
     { "path": "/userId/?" },
-    { "path": "/createdAt/?" }
+    { "path": "/createdAt/?" },
+    { "path": "/isDeleted/?" }
   ],
   "excludedPaths": [
     { "path": "/*" }
   ]
 }
 ```
+
+---
+
+## Entity Handlers (`Shared/Handlers/`)
+
+Reusable Cosmos DB data-access classes that encapsulate CRUD + soft-delete for each document type.
+Both handlers live in `Shared/` so any service (HashTagPersister, UserView, tests) can reference them.
+
+### HashtagDocumentHandler
+
+**File:** `Shared/Handlers/HashtagDocumentHandler.cs`
+**Container:** `Hashtags` — partition key `/hashtag` (`id == hashtag`)
+
+| Method | Cosmos Operation | Description |
+|---|---|---|
+| `InsertAsync(doc)` | `CreateItemAsync` | Creates a new hashtag document. Throws `CosmosException` (409) if it already exists. |
+| `UpdateAsync(doc)` | `UpsertItemAsync` | Insert-or-replace. Idempotent. |
+| `GetAsync(hashtag)` | `ReadItemAsync` | Point read (1 RU). Returns `null` if not found. |
+| `SoftDeleteAsync(hashtag)` | Read → set flags → `UpsertItemAsync` | Sets `IsDeleted = true`, stamps `DeletedAt`. Throws `InvalidOperationException` if not found. |
+| `HardDeleteAsync(hashtag)` | `DeleteItemAsync` | Permanent removal. Swallows 404. Used for test cleanup only. |
+
+### PostDocumentHandler
+
+**File:** `Shared/Handlers/PostDocumentHandler.cs`
+**Container:** `Posts` — partition key `/id` (post GUID)
+
+| Method | Cosmos Operation | Description |
+|---|---|---|
+| `InsertAsync(doc)` | `CreateItemAsync` | Creates a new post document. Throws `CosmosException` (409) on duplicate. |
+| `UpdateAsync(doc)` | `UpsertItemAsync` | Insert-or-replace. Idempotent. |
+| `GetAsync(postId)` | `ReadItemAsync` | Point read (1 RU). Returns `null` if not found. |
+| `SoftDeleteAsync(postId)` | Read → set flags → `UpsertItemAsync` | Sets `IsDeleted = true`, stamps `DeletedAt`. Throws `InvalidOperationException` if not found. |
+| `HardDeleteAsync(postId)` | `DeleteItemAsync` | Permanent removal. Swallows 404. Used for test cleanup only. |
+
+### Handler Usage Pattern
+
+Both handlers take a `Microsoft.Azure.Cosmos.Container` in the constructor (thread-safe):
+
+```csharp
+var handler = new HashtagDocumentHandler(cosmosClient.GetContainer(dbName, "Hashtags"));
+await handler.InsertAsync(new HashtagDocument { Hashtag = "sunset", TotalPostCount = 1 });
+```
+
+### Serialization Note
+
+The Cosmos SDK v3 uses **Newtonsoft.Json** by default. The document models use `[JsonPropertyName]` (System.Text.Json), which only works if the `CosmosClient` is configured with camelCase serialization:
+
+```csharp
+new CosmosClientOptions
+{
+    SerializerOptions = new CosmosSerializationOptions
+    {
+        PropertyNamingPolicy = CosmosPropertyNamingPolicy.CamelCase
+    }
+}
+```
+
+All services and tests **must** set this option when constructing a `CosmosClient`, otherwise the `id` field will not be serialized and Cosmos will reject writes with a 400 error.
+
+---
+
+## Integration Tests (`Shared.Tests/`)
+
+The `Shared.Tests` project contains **live integration tests** that run against the real Cosmos DB account. Tests create documents, verify CRUD + soft-delete behaviour, and clean up after themselves.
+
+### Project Setup
+
+| File | Purpose |
+|---|---|
+| `Shared.Tests/Shared.Tests.csproj` | xUnit test project, references `Shared.csproj` |
+| `Shared.Tests/appsettings.json` | Cosmos DB endpoint + database/container names |
+| `Shared.Tests/CosmosHandlerTests.cs` | All handler integration tests |
+
+### Config (`Shared.Tests/appsettings.json`)
+
+```json
+{
+  "CosmosDb": {
+    "Endpoint": "https://hashtagservice-cosmos.documents.azure.com:443/",
+    "DatabaseName": "HashtagServiceDb",
+    "HashtagsContainerName": "Hashtags",
+    "PostsContainerName": "Posts"
+  }
+}
+```
+
+### Test Architecture
+
+- **`CosmosFixture`** — xUnit `IAsyncLifetime` fixture shared across all tests via `[Collection("Cosmos")]`. Creates a single `CosmosClient` with camelCase serialization and exposes `HashtagsContainer` and `PostsContainer`.
+- **`HashtagDocumentHandlerTests`** — 6 tests covering insert, get, get-not-found, update, soft-delete, and soft-delete-not-found.
+- **`PostDocumentHandlerTests`** — 6 tests covering the same operations for `PostDocument`.
+- **Cleanup** — Each test class tracks created document IDs and calls `HardDeleteAsync` in `DisposeAsync` to leave the containers empty after a test run.
+
+### Test Inventory (12 tests)
+
+| Test Class | Test | Verifies |
+|---|---|---|
+| `HashtagDocumentHandlerTests` | `Insert_CreatesDocument` | Document created with correct fields; `IsDeleted = false`, `DeletedAt = null` |
+| | `Get_ReturnsInsertedDocument` | Point read returns the inserted document |
+| | `Get_ReturnsNull_WhenNotFound` | Returns `null` for non-existent hashtag |
+| | `Update_ModifiesExistingDocument` | Upsert updates `TotalPostCount` and `TopPosts` |
+| | `SoftDelete_SetsFlags` | `IsDeleted` flipped to `true`, `DeletedAt` stamped; persisted to Cosmos |
+| | `SoftDelete_ThrowsWhenNotFound` | Throws `InvalidOperationException` for non-existent hashtag |
+| `PostDocumentHandlerTests` | `Insert_CreatesDocument` | Document created; soft-delete fields default to `false`/`null` |
+| | `Get_ReturnsInsertedDocument` | Point read returns correct document |
+| | `Get_ReturnsNull_WhenNotFound` | Returns `null` for random GUID |
+| | `Update_ModifiesExistingDocument` | Upsert updates `Text` and `Url` |
+| | `SoftDelete_SetsFlags` | Soft-delete flags set and persisted |
+| | `SoftDelete_ThrowsWhenNotFound` | Throws `InvalidOperationException` for random GUID |
+
+### Running Tests
+
+```powershell
+dotnet test Shared.Tests/Shared.Tests.csproj
+```
+
+> **Prerequisite:** You must be authenticated via `az login` (or have a Managed Identity) with the Cosmos DB Built-in Data Contributor role on the `hashtagservice-cosmos` account.
 
 ---
 
@@ -241,6 +370,7 @@ var trendingQuery = new QueryDefinition(
 |---|---|
 | `HashtagPersister/appsettings.json` | `CosmosDb:Endpoint`, `CosmosDb:DatabaseName`, `CosmosDb:ContainerName` |
 | `UserView/appsettings.json` | `CosmosDb:Endpoint`, `CosmosDb:DatabaseName`, `CosmosDb:ContainerName` |
+| `Shared.Tests/appsettings.json` | `CosmosDb:Endpoint`, `CosmosDb:DatabaseName`, `CosmosDb:HashtagsContainerName`, `CosmosDb:PostsContainerName` |
 
 ---
 
@@ -270,4 +400,7 @@ If the user asks, be ready to discuss:
 | 2026-03-21 | Container created | `Hashtags` — partition key `/hashtag`, targeted indexing (`/hashtag/?`, `/totalPostCount/?`) |
 | 2026-03-21 | Container created | `Posts` — partition key `/id`, targeted indexing (`/userId/?`, `/createdAt/?`) |
 | 2026-03-21 | RBAC assigned | Cosmos DB Built-in Data Contributor → principal `346af360-2e13-4bbf-b7ff-47f4865ce521` |
+| 2026-03-21 | Soft-delete added | `IsDeleted` + `DeletedAt` fields on `HashtagDocument` and `PostDocument`; `/isDeleted/?` added to both indexing policies |
+| 2026-03-21 | Handlers created | `Shared/Handlers/HashtagDocumentHandler.cs`, `Shared/Handlers/PostDocumentHandler.cs` — CRUD + soft-delete |
+| 2026-03-21 | Tests created | `Shared.Tests/` — 12 xUnit integration tests against live Cosmos DB (insert, get, update, soft-delete per container) |
 | — | TODO | `UserPartitions` container — reverse-index (partition key `/userId`) |
