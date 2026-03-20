@@ -9,8 +9,9 @@
 ## 1. Purpose
 
 HashTagCounter is an Event Hubs (Kafka-protocol) consumer that reads posts,
-extracts hashtags, **counts** their frequencies, and periodically merges those
-counts into Cosmos DB.
+extracts hashtags, **counts** their frequencies in memory, and periodically
+publishes aggregated `{hashtag, count}` messages to the `hashtags-topic`
+Event Hub (partitioned by hashtag).
 
 ---
 
@@ -52,28 +53,26 @@ Each reader thread maintains **two** `ConcurrentDictionary<string, long>` instan
    - **Writer busy** → **skip the swap, keep reading**. The read dictionary grows past 100.
 3. On every subsequent post (while `_postCount >= BatchSize`), try the swap again.
 4. **Safety cap** (`MaxBatchSize`, default 500): if the read dictionary reaches this size and the writer is *still* busy, the reader **hard-blocks** until the writer finishes. This bounds memory.
-5. The writer thread merges the write dictionary into Cosmos DB, clears it, and releases the semaphore.
+5. The writer thread publishes each `{hashtag, count}` entry from the write dictionary to `hashtags-topic` (partition key = hashtag), clears the dictionary, and releases the semaphore.
 6. After the swap, the reader continues into the fresh (empty) read dictionary immediately.
 
-### 2.4 Database Merge (Cosmos DB)
+### 2.4 Output — Kafka Producer (`hashtags-topic`)
 
 | Aspect | Detail |
 |---|---|
-| Database | Azure Cosmos DB (NoSQL / document) |
-| Partition key | Hashtag string (the `#tag` itself) |
-| Document shape | `{ "id": "<hashtag>", "hashtag": "<hashtag>", "count": <long>, "imageUrls": [...] }` |
-| Merge logic | **Upsert**: if document exists → `count += localCount`; if not → insert with `count = localCount` and empty `imageUrls`. |
-| `imageUrls` field | This service **never modifies** the `imageUrls` array. It must be preserved as-is during merge. |
-| Concurrency | Each writer thread processes its own dictionary slice; multiple writer threads may run concurrently for different partitions. |
+| Target topic | `hashtags-topic` (Azure Event Hubs, Kafka surface) |
+| Partitions | **3** — partitioned by **hashtag** (not PostId) |
+| Message payload | `HashtagCount` JSON: `{ "Hashtag": "<tag>", "Count": <long>, "Timestamp": "<ISO8601>" }` |
+| Partition key | The hashtag string (lowercase). Ensures all counts for the same hashtag land on the same partition. |
+| Publish trigger | On dictionary swap — the writer thread publishes **one message per hashtag** in the write dictionary. |
+| Concurrency | Each writer thread publishes its own dictionary slice; multiple writer threads may run concurrently for different source partitions. |
 
-### 2.5 No Downstream Event Publishing
+### 2.5 Downstream: HashTagPersister
 
-> **Change from current implementation**: The redesigned service does **not**
-> publish `HashtagEvent` messages to `hashtags-topic`.  
-> Counting and persisting happen inside this service. The `hashtags-topic`
-> and downstream `HashTagPersister` are no longer needed for counts.
-
-*(If event publishing is ever re-added it will be a separate concern.)*
+> The downstream `HashTagPersister` service consumes from `hashtags-topic`
+> and is responsible for merging counts into Cosmos DB. This service does
+> **not** interact with Cosmos DB at all — it only reads from Kafka and
+> writes to Kafka.
 
 ---
 
@@ -85,7 +84,7 @@ Each reader thread maintains **two** `ConcurrentDictionary<string, long>` instan
 | **Consistency** | Checkpoint is updated **after** the 100-post batch is successfully accumulated (not after each message). |
 | **Back-pressure** | If the writer is still busy at `BatchSize`, the reader **keeps reading** (non-blocking). Hard block only at `MaxBatchSize` (default 500) as a safety valve to bound memory. |
 | **Thread safety** | The read dictionary is only written by one reader thread. The write dictionary is only read by one writer thread after swap. No cross-thread dictionary sharing without swap handoff. |
-| **Idempotency** | Cosmos DB upsert (read-then-write or patch) must handle concurrent writers for the same hashtag if multiple partitions encounter the same tag. |
+| **At-least-once delivery** | Kafka publishing is at-least-once. Downstream consumer (HashTagPersister) must handle duplicate `{hashtag, count}` messages idempotently. |
 | **Graceful shutdown** | `Ctrl+C` / `SIGTERM` → finish current post, flush partial dictionary to DB, checkpoint, then exit. |
 | **Configuration** | All tunables (batch size, thread count, connection strings) via `appsettings.json`. |
 
@@ -96,7 +95,7 @@ Each reader thread maintains **two** `ConcurrentDictionary<string, long>` instan
 | # | Question | Resolution |
 |---|---|---|
 | Q1 | Should we move to a **multi-instance deployment** (1 process per partition) instead of 3 threads in 1 process? | **✅ Decided: Option B** — 1 thread, 1 process × N instances. Code also works as single process with multiple partitions for local dev. |
-| Q2 | Cosmos DB merge strategy? | **Option A**: Read doc → increment → replace (optimistic concurrency w/ ETag). Patch operations noted as future improvement. |
+| Q2 | Output target? | **✅ Decided: Kafka** — publish `{hashtag, count}` to `hashtags-topic` (partitioned by hashtag). Cosmos DB merge is the responsibility of downstream HashTagPersister. |
 | Q3 | What happens if a post contains 0 hashtags? | Skip, no count entry, still counts toward the batch threshold. |
 | Q4 | Should the 100-post batch be configurable? | **✅ Yes** — `Service:BatchSize` (default 100) and `Service:MaxBatchSize` (default 500, safety cap). |
 | Q5 | Should `SwapAndFlush` block or be non-blocking when writer is busy? | **✅ Decided: Non-blocking** — reader keeps accumulating past `BatchSize`; hard block only at `MaxBatchSize`. Avoids stalling `EventProcessorClient` and risking partition reassignment. |

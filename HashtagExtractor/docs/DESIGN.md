@@ -149,26 +149,23 @@ After all entries merged:
   _writerBusy.Release()   // signal PartitionConsumer that write dict is free
 `
 
-### 3.3 `HashtagDocument` (Cosmos DB shape)
+### 3.3 `HashtagCount` (Kafka message payload)
 
 `csharp
-public class HashtagDocument
+namespace HashtagService.Shared.Models;
+
+public class HashtagCount
 {
-    [JsonPropertyName("id")]
-    public string Id { get; set; }            // the hashtag itself (lowercase)
-
-    [JsonPropertyName("hashtag")]
-    public string Hashtag { get; set; }        // same as id, human-readable
-
-    [JsonPropertyName("count")]
-    public long Count { get; set; }
-
-    [JsonPropertyName("imageUrls")]
-    public List<string> ImageUrls { get; set; } = new();  // NOT modified by this service
+    public string Hashtag { get; set; } = string.Empty;   // lowercase, e.g. "dotnet"
+    public long Count { get; set; }                        // aggregated count for this batch
+    public DateTimeOffset Timestamp { get; set; }          // when this batch was produced
 }
 `
 
-> **Partition key**: `/hashtag`
+> **Partition key**: The `Hashtag` string is used as the Event Hubs partition
+> key, ensuring all counts for the same hashtag arrive at the same downstream
+> partition in `hashtags-topic`. This allows HashTagPersister to aggregate
+> per-hashtag without cross-partition coordination.
 
 ### 3.4 Checkpoint Strategy
 
@@ -182,10 +179,12 @@ This means on crash we may re-process up to 99 posts.
 That is safe because the merge is **additive-idempotent** only if we haven't
 checkpointed yet — and we haven't, so the re-read + re-count is correct.
 
-> ⚠ **Subtle point**: If the writer thread has already merged to Cosmos but
-> we crash before checkpointing, we will double-count up to 100 posts.
-> Accepted trade-off for simplicity. Can be fixed later with a
-> transactional outbox or by storing a `lastCheckpoint` in the Cosmos doc.
+> ⚠ **Subtle point**: If the writer thread has already published to
+> `hashtags-topic` but we crash before checkpointing, the same counts will
+> be published again on restart. This is **at-least-once delivery** — the
+> downstream HashTagPersister must handle duplicate `{hashtag, count}`
+> messages idempotently (e.g., by tracking batch IDs or using idempotent
+> upsert logic).
 
 ---
 
@@ -205,12 +204,12 @@ Thread 1 — Reader Thread (event loop)
   └──► Thread 2 — Writer Thread (background, 1 per partition)
          │
          │  iterates _writeDict
-         │  upserts to Cosmos DB
+         │  publishes {hashtag, count} to hashtags-topic
          │  clears dict
          │  releases semaphore
 `
 
-- **Reader never blocks on Cosmos** under normal load — swap is non-blocking.
+- **Reader never blocks on Kafka publish** under normal load — swap is non-blocking.
 - **Writer is fire-and-forget** from reader's perspective, guarded by semaphore.
 - If writer is slow, reader keeps accumulating past `BatchSize` up to `MaxBatchSize`.
 - Hard block only at `MaxBatchSize` — safety valve to bound memory.
@@ -225,12 +224,8 @@ Thread 1 — Reader Thread (event loop)
   "EventHub": {
     "Namespace": "<NS>.servicebus.windows.net",
     "PostsTopic": "posts-topic",
-    "ConsumerGroup": ""
-  },
-  "CosmosDb": {
-    "Endpoint": "https://<ACCOUNT>.documents.azure.com:443/",
-    "DatabaseName": "hashtagdb",
-    "ContainerName": "hashtags"
+    "HashtagsTopic": "hashtags-topic",
+    "ConsumerGroup": "$Default"
   },
   "CheckpointStorage": {
     "BlobUri": "https://<STORAGE>.blob.core.windows.net/<CONTAINER>"
@@ -243,7 +238,8 @@ Thread 1 — Reader Thread (event loop)
 }
 `
 
-> `HashtagsTopic` is removed — this service no longer publishes events.
+> `CosmosDb` section removed — this service no longer writes to Cosmos DB.
+> `HashtagsTopic` re-added — this service publishes aggregated counts to it.
 
 ---
 
@@ -253,13 +249,15 @@ Thread 1 — Reader Thread (event loop)
 HashtagExtractor/
 ├── Program.cs                  — entry point, wiring
 ├── PartitionConsumer.cs        — per-partition read + count + swap logic
-├── CosmosHashtagWriter.cs      — Cosmos DB merge logic
-├── Models/
-│   └── HashtagDocument.cs      — Cosmos document shape
+├── KafkaHashtagPublisher.cs    — publishes {hashtag, count} to hashtags-topic
 ├── appsettings.json
 └── docs/
     ├── REQUIREMENTS.md
     └── DESIGN.md               ← this file
+
+Shared/Models/
+├── Post.cs                     — input model (unchanged)
+└── HashtagCount.cs             — output model (new: {Hashtag, Count, Timestamp})
 `
 
 ---
@@ -267,8 +265,8 @@ HashtagExtractor/
 ## 7. Sequence Diagram — Steady State
 
 `
-Reader Thread              PartitionConsumer           Writer Thread           Cosmos DB
-─────────────              ─────────────────           ─────────────           ─────────
+Reader Thread              PartitionConsumer           Writer Thread          hashtags-topic
+─────────────              ─────────────────           ─────────────          ──────────────
   │ poll post                    │                          │                      │
   │──────────────────────────────►                          │                      │
   │                    extract hashtags                     │                      │
@@ -283,20 +281,19 @@ Reader Thread              PartitionConsumer           Writer Thread           C
   │                    swap(readDict, writeDict)            │                      │
   │                    checkpoint offset                    │                      │
   │                    fire writer ─────────────────────────►                      │
-  │                              │                   for each (tag,cnt)           │
-  │  continue reading            │                          │────── read doc ─────►│
-  │──────────────────────────────►                          │◄──── doc / 404 ──────│
-  │                    update readDict                      │────── upsert ───────►│
-  │                    postCount++                          │◄──── 200 OK ─────────│
-  │                              │                          │                      │
-  │  ... writer still busy ...   │                          │   ... more tags ...   │
-  │                    postCount == 200                     │                      │
+  │                              │              create EventDataBatch           │
+  │  continue reading            │              for each (tag, cnt):            │
+  │──────────────────────────────►              add {tag, cnt, ts}              │
+  │                    update readDict              │                      │
+  │                    postCount++                  │──── SendBatchAsync ───►│
+  │                              │                  │◄──────── ACK ─────────│
+  │  ... writer still busy ...   │              dict.Clear()                   │
+  │                    postCount == 200             release semaphore            │
   │                    TrySwapAndFlush()                    │                      │
   │                    _writerBusy.Wait(0) → false          │                      │
   │                    skip swap, keep reading              │                      │
   │──────────────────────────────►                          │                      │
   │                    update readDict                      │                      │
-  │                              │                   release semaphore             │
   │                              │                          │                      │
   │  ... next post ...           │                          │                      │
   │                    postCount == 201                      │                      │
@@ -313,31 +310,34 @@ Reader Thread              PartitionConsumer           Writer Thread           C
 | Scenario | Handling |
 |---|---|
 | Deserialization failure | Log, skip post, still increment postCount |
-| Cosmos DB transient error | Retry with exponential backoff (3 attempts) |
-| Cosmos DB 412 (ETag conflict) | Re-read doc, re-increment, retry |
-| Cosmos DB 429 (throttled) | Honor `RetryAfter` header |
-| Event Hub disconnect | `EventProcessorClient` reconnects automatically |
+| Kafka publish transient error | Retry with exponential backoff (3 attempts) |
+| Kafka publish timeout | Retry; if exhausted, log and release semaphore (batch lost, will re-accumulate from checkpoint) |
+| Event Hub disconnect (consumer) | `EventProcessorClient` reconnects automatically |
+| Event Hub disconnect (producer) | `EventHubProducerClient` reconnects automatically |
 | Writer thread exception | Log, release semaphore, reader will retry on next swap |
 
 ---
 
 ## 9. Future Considerations
 
-- **Transactional outbox**: To eliminate the double-count window, write
-  checkpoint + counts atomically (e.g., store checkpoint offset inside Cosmos).
+- **Idempotent delivery**: Add a batch ID or sequence number to each
+  `HashtagCount` message so the downstream HashTagPersister can deduplicate
+  on crash/replay.
 - **Windowed counting**: Aggregate by time window (e.g., 1-minute tumbling)
-  for trending analytics.
-- **Patch operations**: Use Cosmos DB partial update (`PatchItemAsync`) for
-  atomic `count += N` without read-modify-write.
+  for trending analytics before publishing.
+- **Batch compression**: Enable Event Hubs compression for the producer to
+  reduce network overhead on large batches.
+- **Schema evolution**: If `HashtagCount` gains new fields, use a schema
+  registry or versioned JSON to avoid breaking downstream consumers.
 
 ---
 
 ## 10. Next Steps
 
 1. ✅ Review and finalize this design.
-2. Create `HashtagDocument` model in `HashtagExtractor/Models/`.
-3. Implement `CosmosHashtagWriter`.
+2. Create `HashtagCount` model in `Shared/Models/`.
+3. Implement `KafkaHashtagPublisher`.
 4. Implement `PartitionConsumer`.
 5. Rewire `Program.cs`.
-6. Update `appsettings.json` and `.csproj` (add Cosmos SDK).
+6. Update `appsettings.json` and `.csproj` (no Cosmos SDK needed).
 7. Test locally with 1 instance / 3 partitions.
