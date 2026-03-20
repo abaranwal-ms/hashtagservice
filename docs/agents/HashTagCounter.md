@@ -18,15 +18,16 @@ You are **HashTagCounter**, the agent responsible for the **HashtagExtractor** p
 
 ## What This Service Does
 
-HashTagCounter is an **Event Hubs consumer** that:
+HashTagCounter is an **Event Hubs consumer + Cosmos DB reader** that:
 
-1. **Reads** serialized `Post` JSON messages from the `posts-topic` Event Hub.
-2. **Extracts** all words prefixed with `#` from `Post.Text`.
-3. **Counts** hashtag frequencies in memory using a double-buffer dictionary pattern.
-4. **Publishes** aggregated `HashtagCount` messages (one per hashtag) to the `hashtags-topic` Event Hub, partitioned by hashtag.
-5. **Checkpoints** in Azure Blob Storage after each batch swap (every ~100 posts), not per event.
+1. **Reads** `PostNotification` messages (containing only a `PostId`) from the `posts-topic` Event Hub.
+2. **Fetches** the full `PostDocument` from **Azure Cosmos DB** via `PostDocumentHandler.GetAsync()` (1 RU point read).
+3. **Extracts** all words prefixed with `#` from `PostDocument.Text`.
+4. **Counts** hashtag frequencies in memory using a double-buffer dictionary pattern.
+5. **Publishes** aggregated `HashtagCount` messages (one per hashtag) to the `hashtags-topic` Event Hub, partitioned by hashtag.
+6. **Checkpoints** in Azure Blob Storage after each batch swap (every ~100 posts), not per event.
 
-This service does **not** interact with Cosmos DB — it only reads from Kafka and writes to Kafka. The downstream HashTagPersister is responsible for merging counts into the database.
+This service **reads** from Cosmos DB (Posts container) but does **not write** to it. The downstream HashTagPersister is responsible for merging counts into the Hashtags container.
 
 ---
 
@@ -35,7 +36,8 @@ This service does **not** interact with Cosmos DB — it only reads from Kafka a
 ### Concurrency Model
 
 - Uses `EventProcessorClient` (partition-aware, consumer-group-based).
-- A `SemaphoreSlim(ThreadCount)` limits how many partition events are processed concurrently.
+- One `PartitionConsumer` per partition, created lazily via `ConcurrentDictionary.GetOrAdd()`.
+- Each `PartitionConsumer` is single-threaded internally with a background writer thread guarded by `SemaphoreSlim(1,1)`.
 - `EventProcessorClient` auto-balances partitions if multiple instances run.
 
 ### Key Code Paths
@@ -43,18 +45,32 @@ This service does **not** interact with Cosmos DB — it only reads from Kafka a
 ```
 Program.cs
 ├── Config load (appsettings.json)
-├── EventHubProducerClient  → hashtags-topic (shared, thread-safe)
+├── CosmosClient (shared, thread-safe) → PostDocumentHandler
+├── EventHubProducerClient → EventHubProducerHandler → KafkaHashtagPublisher
 ├── BlobContainerClient     → checkpoint storage
 ├── EventProcessorClient    → reads posts-topic
-│   ├── ProcessEventAsync   → calls HandlePostEventAsync()
+│   ├── ProcessEventAsync   → deserialize PostNotification → dispatch to PartitionConsumer
 │   └── ProcessErrorAsync   → logs to stderr
-├── HandlePostEventAsync()
-│   ├── Deserialize Post from event body
-│   ├── ExtractHashtags(post.Text) → List<string>
-│   ├── Build HashtagEvent
-│   ├── Publish to hashtags-topic
-│   └── Update checkpoint
-└── ExtractHashtags()       → split on space, filter '#', trim, lowercase, distinct
+├── Graceful shutdown → StopProcessingAsync → FlushRemainingAsync per consumer
+│
+PartitionConsumer.cs (per partition)
+├── ProcessEventAsync(postId)
+│   ├── PostDocumentHandler.GetAsync(postId) → fetch from Cosmos (1 RU)
+│   ├── ExtractHashtags(postDoc.Text) → List<string>
+│   ├── _readDict.AddOrUpdate per hashtag
+│   ├── _postCount++
+│   └── If _postCount >= _batchSize → TrySwapAndFlushAsync()
+├── TrySwapAndFlushAsync()
+│   ├── Non-blocking swap at BatchSize, hard block at MaxBatchSize
+│   └── Fire background writer → KafkaHashtagPublisher.PublishAsync() → checkpoint
+└── FlushRemainingAsync()  → shutdown: flush remaining _readDict
+│
+KafkaHashtagPublisher.cs
+├── PublishAsync(dict, partitionId)
+│   ├── For each (hashtag, count): SendWithRetryAsync()
+│   │   └── EventHubProducerHandler.SendEventAsync (from Shared/Handlers/)
+│   └── dict.Clear()
+└── SendWithRetryAsync() → exponential backoff, 3 attempts
 ```
 
 ### Dependencies (NuGet)
@@ -63,6 +79,7 @@ Program.cs
 - `Azure.Messaging.EventHubs` — core types
 - `Azure.Messaging.EventHubs.Processor` — `EventProcessorClient`
 - `Azure.Storage.Blobs` — checkpoint blob container
+- `Microsoft.Azure.Cosmos` — Cosmos DB SDK v3 (transitive via `Shared.csproj`)
 - `Microsoft.Extensions.Configuration.Json` — config
 
 ### Config Shape (`appsettings.json`)
@@ -78,10 +95,14 @@ Program.cs
   "CheckpointStorage": {
     "BlobUri": "https://<STORAGE>.blob.core.windows.net/<CONTAINER>"
   },
+  "CosmosDb": {
+    "Endpoint": "https://<YOUR_COSMOS>.documents.azure.com:443/",
+    "DatabaseName": "HashtagServiceDb",
+    "PostsContainerName": "Posts"
+  },
   "Service": {
     "BatchSize": 100,
-    "MaxBatchSize": 500,
-    "ThreadCount": 3
+    "MaxBatchSize": 500
   }
 }
 ```
@@ -111,14 +132,22 @@ The core logic lives in a **`PartitionConsumer` class** that is single-threaded 
 ### High-Level Architecture
 
 ```
-  ┌─────────────────────────────────────────────────────────┐
-  │                  HashTagCounter Instance                 │
-  │                                                         │
-  │  ┌──────────────────────┐     ┌──────────────────────┐  │
-  │  │   EventProcessor /   │     │   PartitionConsumer  │  │
-  │  │   Kafka Consumer     │────►│   (per partition)    │  │
-  │  │   (posts-topic)      │     │                      │  │
-  │  └──────────────────────┘     │  ┌────────────────┐  │  │
+                                    ┌─────────────────┐
+                                    │   Cosmos DB      │
+                                    │   Posts container│
+                                    └────────▲────────┘
+                                             │ point read (1 RU)
+  ┌──────────────────────────────────────────┼──────────────┐
+  │                  HashTagCounter Instance  │              │
+  │                                          │              │
+  │  ┌──────────────────────┐     ┌──────────┼───────────┐  │
+  │  │   EventProcessor     │     │   PartitionConsumer  │  │
+  │  │   (posts-topic)      │────►│   (per partition)    │  │
+  │  │   PostNotification   │     │                      │  │
+  │  └──────────────────────┘     │  PostDocumentHandler │  │
+  │                               │  fetch post by ID    │  │
+  │                               │  ExtractHashtags()   │  │
+  │                               │  ┌────────────────┐  │  │
   │                               │  │ Read Dictionary│  │  │
   │                               │  │ (accumulating) │  │  │
   │                               │  └───────┬────────┘  │  │
@@ -131,7 +160,8 @@ The core logic lives in a **`PartitionConsumer` class** that is single-threaded 
   │                                          │              │
   │                               ┌──────────▼───────────┐  │
   │                               │   WriterThread       │  │
-  │                               │   (Kafka publish)    │  │
+  │                               │   KafkaHashtagPublisher  │
+  │                               │   → EventHubProducerHandler
   │                               └──────────┬───────────┘  │
   │                                          │              │
   └──────────────────────────────────────────┼──────────────┘
@@ -159,13 +189,17 @@ Fields:
   - _maxBatchSize: int  (safety cap, default 500)
   - _writerBusy  : SemaphoreSlim(1,1)  — guards the writer thread
   - _partitionId : string
+  - _publisher   : KafkaHashtagPublisher
+  - _postHandler : PostDocumentHandler  — fetches posts from Cosmos DB
 
 Methods:
-  + ProcessEventAsync(Post post) : Task
-      1. Extract hashtags from post.Text
-      2. For each hashtag: _readDict.AddOrUpdate(tag, 1, (k,v) => v+1)
-      3. _postCount++
-      4. If _postCount >= _batchSize → TrySwapAndFlush()
+  + ProcessEventAsync(Guid postId) : Task
+      1. PostDocumentHandler.GetAsync(postId) → fetch PostDocument from Cosmos (1 RU)
+      2. If not found → log warning, still increment _postCount, return
+      3. Extract hashtags from postDoc.Text
+      4. For each hashtag: _readDict.AddOrUpdate(tag, 1, (k,v) => v+1)
+      5. _postCount++
+      6. If _postCount >= _batchSize → TrySwapAndFlush()
 
   - TrySwapAndFlush() : Task
       1. If _postCount >= _maxBatchSize:
@@ -188,14 +222,19 @@ Methods:
 #### `KafkaHashtagPublisher` (Writer Thread)
 
 Takes a dictionary snapshot and publishes to `hashtags-topic`.
+Delegates to the shared `EventHubProducerHandler` (from `Shared/Handlers/`) for serialization + send.
+Adds retry with exponential backoff (3 attempts) on top.
 
 ```
+Field:
+  - _producerHandler : EventHubProducerHandler  (wraps EventHubProducerClient)
+
 Method: PublishAsync(dict, partitionId) : Task
 ───────────────────────────────────────────────
 For each (hashtag, count) in dict:
-  1. Create EventDataBatch
-  2. Add HashtagCount { Hashtag = hashtag, Count = count, Timestamp = now }
-  3. SendBatchAsync with partition key = hashtag
+  1. Build HashtagCount { Hashtag = hashtag, Count = count, Timestamp = now }
+  2. SendWithRetryAsync → _producerHandler.SendEventAsync(payload, partitionKey=hashtag)
+  3. Retry up to 3× with exponential backoff on transient errors
 After all entries published:
   dict.Clear()
   _writerBusy.Release()   // signal PartitionConsumer that write dict is free
@@ -245,8 +284,9 @@ On crash, up to 99 posts may be re-processed. This is safe because the merge is 
 ```
 Thread 1 — Reader Thread (event loop)
   │
-  │  reads posts from partition
-  │  extracts hashtags
+  │  receives PostNotification from partition
+  │  fetches PostDocument from Cosmos DB (point read, 1 RU)
+  │  extracts hashtags from postDoc.Text
   │  updates _readDict
   │  every BatchSize posts → TrySwapAndFlush()
   │    ├── writer free?  → swap + hand off, keep reading
@@ -256,12 +296,14 @@ Thread 1 — Reader Thread (event loop)
   └──► Thread 2 — Writer Thread (background, 1 per partition)
          │
          │  iterates _writeDict
-         │  publishes {hashtag, count} to hashtags-topic
+         │  publishes {hashtag, count} via EventHubProducerHandler
          │  clears dict
+         │  checkpoints
          │  releases semaphore
 ```
 
 - **Reader never blocks on Kafka publish** under normal load — swap is non-blocking.
+- **Reader blocks on Cosmos read** per event (~1ms per point read) — acceptable at this scale.
 - **Writer is fire-and-forget** from reader's perspective, guarded by semaphore.
 - If writer is slow, reader keeps accumulating past `BatchSize` up to `MaxBatchSize`.
 - Hard block only at `MaxBatchSize` — safety valve to bound memory.
@@ -272,76 +314,80 @@ Thread 1 — Reader Thread (event loop)
 ### Sequence Diagram — Steady State
 
 ```
-Reader Thread              PartitionConsumer           Writer Thread          hashtags-topic
-─────────────              ─────────────────           ─────────────          ──────────────
-  │ poll post                    │                          │                      │
-  │──────────────────────────────►                          │                      │
-  │                    extract hashtags                     │                      │
-  │                    update readDict                      │                      │
-  │                    postCount++                          │                      │
-  │                              │                          │                      │
-  │  ... repeat 99 more times ...│                          │                      │
-  │                              │                          │                      │
-  │                    postCount == 100                     │                      │
-  │                    TrySwapAndFlush()                    │                      │
-  │                    _writerBusy.Wait(0) → true           │                      │
-  │                    swap(readDict, writeDict)            │                      │
-  │                    checkpoint offset                    │                      │
-  │                    fire writer ─────────────────────────►                      │
-  │                              │              create EventDataBatch              │
-  │  continue reading            │              for each (tag, cnt):               │
-  │──────────────────────────────►              add {tag, cnt, ts}                 │
-  │                    update readDict              │                              │
-  │                    postCount++                  │──── SendBatchAsync ──────────►│
-  │                              │                  │◄──────── ACK ───────────────│
-  │  ... writer still busy ...   │              dict.Clear()                       │
-  │                    postCount == 200             release semaphore               │
-  │                    TrySwapAndFlush()                    │                      │
-  │                    _writerBusy.Wait(0) → false          │                      │
-  │                    skip swap, keep reading              │                      │
-  │──────────────────────────────►                          │                      │
-  │                    update readDict                      │                      │
-  │                              │                          │                      │
-  │  ... next post ...           │                          │                      │
-  │                    postCount == 201                     │                      │
-  │                    TrySwapAndFlush()                    │                      │
-  │                    _writerBusy.Wait(0) → true           │                      │
-  │                    swap + fire writer  ─────────────────►                      │
-  │                              │                          │                      │
+Reader Thread              PartitionConsumer           Cosmos DB             Writer Thread          hashtags-topic
+─────────────              ─────────────────           ─────────             ─────────────          ──────────────
+  │ PostNotification             │                        │                      │                      │
+  │──────────────────────────────►                        │                      │                      │
+  │                    GetAsync(postId)───────────────────►│                      │                      │
+  │                              │◄──── PostDocument ─────│                      │                      │
+  │                    extract hashtags                    │                      │                      │
+  │                    update readDict                     │                      │                      │
+  │                    postCount++                         │                      │                      │
+  │                              │                         │                      │                      │
+  │  ... repeat 99 more times ...│                         │                      │                      │
+  │                              │                         │                      │                      │
+  │                    postCount == 100                    │                      │                      │
+  │                    TrySwapAndFlush()                   │                      │                      │
+  │                    _writerBusy.Wait(0) → true          │                      │                      │
+  │                    swap(readDict, writeDict)           │                      │                      │
+  │                    fire writer ────────────────────────┼──────────────────────►                      │
+  │                              │                         │       for each (tag, cnt):                  │
+  │  continue reading            │                         │       SendEventAsync(HashtagCount)          │
+  │──────────────────────────────►                         │              │                              │
+  │                    GetAsync(postId)───────────────────►│              │──── SendAsync ───────────────►│
+  │                    update readDict                     │              │◄──────── ACK ───────────────│
+  │                    postCount++                         │       dict.Clear()                          │
+  │                              │                         │       checkpoint                            │
+  │  ... writer finishes ...     │                         │       release semaphore                     │
 ```
 
 ---
 
-## Target File / Class Layout
+## File / Class Layout
 
 ```
 HashtagExtractor/
-├── Program.cs                  — entry point, wiring
-├── PartitionConsumer.cs        — per-partition read + count + swap logic
-├── KafkaHashtagPublisher.cs    — publishes {hashtag, count} to hashtags-topic
-├── appsettings.json
-└── docs/                       — (removed; content consolidated into this agent)
+├── Program.cs                  — entry point, wiring (CosmosClient + EventProcessorClient)
+├── PartitionConsumer.cs        — per-partition: Cosmos fetch + extract + count + swap logic
+├── KafkaHashtagPublisher.cs    — publishes {hashtag, count} via shared EventHubProducerHandler
+└── appsettings.json
 
 Shared/Models/
-├── Post.cs                     — input model (unchanged)
-└── HashtagCount.cs             — output model (new: {Hashtag, Count, Timestamp})
+├── PostNotification.cs         — INPUT: lightweight event from posts-topic ({PostId})
+├── PostDocument.cs             — Cosmos DB document fetched by PartitionConsumer
+├── HashtagCount.cs             — OUTPUT: aggregated count to hashtags-topic
+├── Post.cs                     — domain model (used by PostCreator)
+└── ...
+
+Shared/Handlers/
+├── PostDocumentHandler.cs      — REUSED: Cosmos CRUD for Posts container
+├── EventHubProducerHandler.cs  — REUSED: generic Event Hub send wrapper
+└── ...
 ```
 
 ---
 
-## Shared Models You Use
+## Shared Models & Handlers You Use
 
 ```csharp
-// Shared/Models/Post.cs — INPUT
-public class Post
+// Shared/Models/PostNotification.cs — INPUT (from posts-topic)
+public class PostNotification
 {
-    public Guid Id { get; set; }
-    public string Url { get; set; }
-    public string Text { get; set; }       // contains #hashtags
-    public DateTimeOffset CreatedAt { get; set; }
+    public Guid PostId { get; set; }
 }
 
-// Shared/Models/HashtagCount.cs — OUTPUT (new)
+// Shared/Models/PostDocument.cs — FETCHED from Cosmos DB
+public class PostDocument
+{
+    public string Id { get; set; }          // post GUID as string
+    public string UserId { get; set; }
+    public string Url { get; set; }
+    public string Text { get; set; }        // contains #hashtags
+    public DateTimeOffset CreatedAt { get; set; }
+    // ... soft-delete fields
+}
+
+// Shared/Models/HashtagCount.cs — OUTPUT (to hashtags-topic)
 public class HashtagCount
 {
     public string Hashtag { get; set; } = string.Empty;   // lowercase, e.g. "dotnet"
@@ -349,6 +395,13 @@ public class HashtagCount
     public DateTimeOffset Timestamp { get; set; }          // when this batch was produced
 }
 ```
+
+### Shared Handlers Reused
+
+| Handler | From | Used For |
+|---|---|---|
+| `PostDocumentHandler` | `Shared/Handlers/` | Cosmos point read to fetch post by ID (1 RU) |
+| `EventHubProducerHandler` | `Shared/Handlers/` | Serialization + send to `hashtags-topic` (wrapped by `KafkaHashtagPublisher` with retry) |
 
 > **Partition key**: The `Hashtag` string is used as the Event Hubs partition key, ensuring all counts for the same hashtag arrive at the same downstream partition in `hashtags-topic`. This allows HashTagPersister to aggregate per-hashtag without cross-partition coordination.
 
@@ -358,7 +411,9 @@ public class HashtagCount
 
 | Scenario | Handling |
 |---|---|
-| Deserialization failure | Log, skip post, still increment `postCount` |
+| Deserialization failure | Log, skip notification, return |
+| Post not found in Cosmos DB | Log warning, skip, still increment `postCount` |
+| Cosmos transient error | Cosmos SDK retries internally; unrecoverable errors logged, skip post |
 | Kafka publish transient error | Retry with exponential backoff (3 attempts) |
 | Kafka publish timeout | Retry; if exhausted, log and release semaphore (batch lost, will re-accumulate from checkpoint) |
 | Event Hub disconnect (consumer) | `EventProcessorClient` reconnects automatically |
@@ -372,6 +427,7 @@ public class HashtagCount
 
 | Case | Behaviour |
 |---|---|
+| Post not found in Cosmos (deleted or not yet replicated) | Log, skip, still increment `postCount` |
 | Post with 0 hashtags | Skip, still increment `postCount` |
 | Crash after Kafka publish but before checkpoint | At-least-once: same counts re-published on restart; downstream must be idempotent |
 | Writer busy at `BatchSize` | Non-blocking skip, reader keeps accumulating |
@@ -393,19 +449,21 @@ public class HashtagCount
 1. **Scope** — Only modify files inside `HashtagExtractor/` and `Shared/` (if shared model changes are needed).
 2. **Style** — Top-level `Program.cs`, no Startup class, `ConfigurationBuilder` pattern.
 3. **Threading** — Use `SemaphoreSlim` to control concurrency. Never spin up raw threads.
-4. **Serialization** — `System.Text.Json` only.
+4. **Serialization** — `System.Text.Json` only (Event Hub payloads); Cosmos SDK handles its own serialization with camelCase.
 5. **Error handling** — Log to `Console.Error`, never crash the processor loop.
 6. **Checkpointing** — Checkpoint after each batch swap (~100 posts), not per event.
 7. **Naming** — The agent is called HashTagCounter, the folder is HashtagExtractor. Use the agent name in conversation, the folder name in code.
 8. **Testing** — If asked to add tests, create an `HashtagExtractor.Tests/` xUnit project.
-9. **No Cosmos DB** — This service does not write to Cosmos. It reads from Kafka and writes to Kafka only.
+9. **Cosmos DB — read only** — This service reads from the Posts container (point reads) but does **not write** to Cosmos.
 10. **Back-pressure** — Non-blocking swap at `BatchSize`; hard block only at `MaxBatchSize`.
+11. **Reuse shared handlers** — Use `PostDocumentHandler` and `EventHubProducerHandler` from `Shared/Handlers/`. Do not duplicate SDK plumbing.
 
 ---
 
 ## Upstream / Downstream
 
-| Direction | Service | Topic | Payload |
+| Direction | Service | Topic / Store | Payload |
 |---|---|---|---|
-| ← reads from | PostCreator | `posts-topic` | `Post` JSON |
-| → writes to | HashTagPersister | `hashtags-topic` | `HashtagCount` JSON |
+| ← reads from | PostCreator | `posts-topic` | `PostNotification` JSON (`{PostId}`) |
+| ← reads from | Cosmos DB | `HashtagServiceDb` / `Posts` | `PostDocument` (point read by ID) |
+| → writes to | HashTagPersister | `hashtags-topic` | `HashtagCount` JSON (`{Hashtag, Count, Timestamp}`) |

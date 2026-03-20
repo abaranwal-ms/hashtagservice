@@ -3,8 +3,12 @@ using Azure.Messaging.EventHubs;
 using Azure.Messaging.EventHubs.Processor;
 using Azure.Messaging.EventHubs.Producer;
 using Azure.Storage.Blobs;
+using HashtagExtractor;
+using HashtagService.Shared.Handlers;
 using HashtagService.Shared.Models;
+using Microsoft.Azure.Cosmos;
 using Microsoft.Extensions.Configuration;
+using System.Collections.Concurrent;
 using System.Text.Json;
 
 var config = new ConfigurationBuilder()
@@ -12,47 +16,85 @@ var config = new ConfigurationBuilder()
     .AddJsonFile("appsettings.json", optional: false)
     .Build();
 
-var ehNamespace    = config["EventHub:Namespace"]!;
-var postsTopic     = config["EventHub:PostsTopic"]!;
-var hashtagsTopic  = config["EventHub:HashtagsTopic"]!;
-var consumerGroup  = config["EventHub:ConsumerGroup"] ?? "$Default";
-var checkpointUri  = config["CheckpointStorage:BlobUri"]!;
-int threadCount    = int.Parse(config["Service:ThreadCount"] ?? "3");
+var ehNamespace   = config["EventHub:Namespace"]!;
+var postsTopic    = config["EventHub:PostsTopic"]!;
+var hashtagsTopic = config["EventHub:HashtagsTopic"]!;
+var consumerGroup = config["EventHub:ConsumerGroup"] ?? "$Default";
+var checkpointUri = config["CheckpointStorage:BlobUri"]!;
+int batchSize     = int.Parse(config["Service:BatchSize"] ?? "100");
+int maxBatchSize  = int.Parse(config["Service:MaxBatchSize"] ?? "500");
 
-Console.WriteLine($"[HashtagExtractor] Listening on {ehNamespace}/{postsTopic} → publishing to {hashtagsTopic}");
+var cosmosEndpoint      = config["CosmosDb:Endpoint"]!;
+var cosmosDatabaseName  = config["CosmosDb:DatabaseName"]!;
+var postsContainerName  = config["CosmosDb:PostsContainerName"]!;
+
+Console.WriteLine($"[HashtagExtractor] Namespace:     {ehNamespace}");
+Console.WriteLine($"[HashtagExtractor] Posts topic:    {postsTopic}");
+Console.WriteLine($"[HashtagExtractor] Hashtags topic: {hashtagsTopic}");
+Console.WriteLine($"[HashtagExtractor] Cosmos:         {cosmosEndpoint} / {cosmosDatabaseName} / {postsContainerName}");
+Console.WriteLine($"[HashtagExtractor] BatchSize={batchSize}, MaxBatchSize={maxBatchSize}");
 
 using var cts = new CancellationTokenSource();
 Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
 
-// Shared producer: publish extracted hashtag events to hashtags-topic
+// Cosmos DB client for fetching post data (thread-safe)
+var cosmosClient = new CosmosClient(cosmosEndpoint, new DefaultAzureCredential(),
+    new CosmosClientOptions
+    {
+        SerializerOptions = new CosmosSerializationOptions
+        {
+            PropertyNamingPolicy = CosmosPropertyNamingPolicy.CamelCase
+        }
+    });
+var postsContainer = cosmosClient.GetContainer(cosmosDatabaseName, postsContainerName);
+var postHandler = new PostDocumentHandler(postsContainer);
+
+// Shared producer for hashtags-topic (thread-safe per SDK docs)
 await using var hashtagProducer = new EventHubProducerClient(
     ehNamespace, hashtagsTopic, new DefaultAzureCredential());
 
-// EventProcessorClient uses blob storage for distributed checkpointing.
-// Multiple instances of this service will each pick up different partitions automatically.
+var producerHandler = new EventHubProducerHandler(hashtagProducer);
+var publisher = new KafkaHashtagPublisher(producerHandler);
+
+// One PartitionConsumer per partition, created on first event
+var partitionConsumers = new ConcurrentDictionary<string, PartitionConsumer>();
+
+// Blob storage for distributed checkpointing
 var storageClient = new BlobContainerClient(new Uri(checkpointUri), new DefaultAzureCredential());
+
+// EventProcessorClient: partition-balanced, consumer-group-based.
+// Multiple instances of this service each pick up different partitions automatically.
 var processor = new EventProcessorClient(
     storageClient, consumerGroup, ehNamespace, postsTopic, new DefaultAzureCredential());
 
-// Semaphore to limit concurrent partition processing to ThreadCount
-var semaphore = new SemaphoreSlim(threadCount, threadCount);
-
 processor.ProcessEventAsync += async args =>
 {
-    await semaphore.WaitAsync(cts.Token);
+    if (!args.HasEvent) return;
+
+    PostNotification? notification;
     try
     {
-        await HandlePostEventAsync(args, hashtagProducer, cts.Token);
+        notification = JsonSerializer.Deserialize<PostNotification>(args.Data.Body.ToArray());
     }
-    finally
+    catch (JsonException ex)
     {
-        semaphore.Release();
+        Console.Error.WriteLine($"[HashtagExtractor] Deserialization error: {ex.Message}");
+        return;
     }
+
+    if (notification is null) return;
+
+    var consumer = partitionConsumers.GetOrAdd(
+        args.Partition.PartitionId,
+        pid => new PartitionConsumer(pid, publisher, postHandler, batchSize, maxBatchSize));
+
+    await consumer.ProcessEventAsync(notification.PostId, args, cts.Token);
 };
 
 processor.ProcessErrorAsync += args =>
 {
-    Console.Error.WriteLine($"[HashtagExtractor] Partition {args.PartitionId} error: {args.Exception.Message}");
+    Console.Error.WriteLine(
+        $"[HashtagExtractor] Partition {args.PartitionId} error ({args.Operation}): {args.Exception.Message}");
     return Task.CompletedTask;
 };
 
@@ -62,68 +104,21 @@ Console.WriteLine("[HashtagExtractor] Processor started. Press Ctrl+C to stop.")
 try { await Task.Delay(Timeout.Infinite, cts.Token); }
 catch (OperationCanceledException) { }
 
+Console.WriteLine("[HashtagExtractor] Shutting down...");
 await processor.StopProcessingAsync();
-Console.WriteLine("[HashtagExtractor] Processor stopped.");
 
-static async Task HandlePostEventAsync(
-    ProcessEventArgs args,
-    EventHubProducerClient producer,
-    CancellationToken ct)
+// Flush remaining counts from all partition consumers
+using var shutdownCts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+foreach (var (pid, consumer) in partitionConsumers)
 {
-    if (!args.HasEvent)
-        return;
-
-    Post? post;
     try
     {
-        post = JsonSerializer.Deserialize<Post>(args.Data.Body.ToArray());
+        await consumer.FlushRemainingAsync(shutdownCts.Token);
     }
-    catch (JsonException ex)
+    catch (Exception ex)
     {
-        Console.Error.WriteLine($"[HashtagExtractor] Deserialization error: {ex.Message}");
-        return;
+        Console.Error.WriteLine($"[HashtagExtractor] Flush error for partition {pid}: {ex.Message}");
     }
-
-    if (post is null)
-        return;
-
-    var hashtags = ExtractHashtags(post.Text);
-    if (hashtags.Count == 0)
-    {
-        await args.UpdateCheckpointAsync(ct);
-        return;
-    }
-
-    // One send per hashtag is intentional: each hashtag is a distinct partition key,
-    // so events for different hashtags cannot share a batch.  Grouping by key within
-    // a single-post handler would yield the same N sends for N distinct hashtags.
-    var extractedAt = DateTimeOffset.UtcNow;
-    foreach (var hashtag in hashtags)
-    {
-        var hashtagEvent = new HashtagEvent
-        {
-            PostId      = post.Id,
-            Hashtags    = new List<string> { hashtag },
-            ExtractedAt = extractedAt
-        };
-
-        using var batch = await producer.CreateBatchAsync(
-            new CreateBatchOptions { PartitionKey = hashtag }, ct);
-        batch.TryAdd(new EventData(JsonSerializer.Serialize(hashtagEvent)));
-        await producer.SendAsync(batch, ct);
-    }
-
-    Console.WriteLine($"[Partition-{args.Partition.PartitionId}] Post {post.Id} → hashtags: {string.Join(", ", hashtags)}");
-
-    await args.UpdateCheckpointAsync(ct);
 }
 
-static List<string> ExtractHashtags(string text)
-{
-    return text
-        .Split(' ', StringSplitOptions.RemoveEmptyEntries)
-        .Where(w => w.StartsWith('#') && w.Length > 1)
-        .Select(w => w.TrimStart('#').ToLowerInvariant())
-        .Distinct()
-        .ToList();
-}
+Console.WriteLine("[HashtagExtractor] Stopped.");
