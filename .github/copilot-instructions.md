@@ -9,19 +9,22 @@
 
 ### Service Agents
 
-| Agent | Invoke with | Scope |
-|---|---|---|
-| **PostCreator** | `#PostCreator` | PostGenerator project — fake social-post producer |
-| **HashTagCounter** | `#HashTagCounter` | HashtagExtractor project — extracts & counts hashtags |
-| **HashTagPersister** | `#HashTagPersister` | HashtagPersister project — writes hashtag data to Cosmos DB |
-| **UserView** | `#UserView` | UserView project (NEW) — query API for trending hashtags |
+| Agent | Invoke with (VS Code) | Full Instructions | Scope |
+|---|---|---|---|
+| **PostCreator** | `#PostCreator` | [docs/agents/PostCreator.md](../docs/agents/PostCreator.md) | PostGenerator project — fake social-post producer |
+| **HashTagCounter** | `#HashTagCounter` | [docs/agents/HashTagCounter.md](../docs/agents/HashTagCounter.md) | HashtagExtractor project — extracts & counts hashtags |
+| **HashTagPersister** | `#HashTagPersister` | [docs/agents/HashTagPersister.md](../docs/agents/HashTagPersister.md) | HashtagPersister project — writes hashtag data to Cosmos DB |
+| **UserView** | `#UserView` | [docs/agents/UserView.md](../docs/agents/UserView.md) | UserView project (NEW) — query API for trending hashtags |
 
 ### Infrastructure Agents
 
-| Agent | Invoke with | Scope |
-|---|---|---|
-| **Kafka** | `#Kafka` | Event Hubs namespace, topics, partitions, consumer groups, Blob checkpoints |
-| **Database** | `#Database` | Cosmos DB account, containers, partition keys, indexing, queries, RBAC |
+| Agent | Invoke with (VS Code) | Full Instructions | Scope |
+|---|---|---|---|
+| **Kafka** | `#Kafka` | [docs/agents/Kafka.md](../docs/agents/Kafka.md) | Event Hubs namespace, topics, partitions, consumer groups, Blob checkpoints |
+| **Database** | `#Database` | [docs/agents/Database.md](../docs/agents/Database.md) | Cosmos DB account, containers, partition keys, indexing, queries, RBAC |
+
+> **GitHub.com Copilot users:** The agent docs above contain all context for each service.
+> Reference the linked file when asking Copilot about a specific service or infrastructure component.
 
 ---
 
