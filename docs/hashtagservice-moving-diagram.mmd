@@ -1,0 +1,65 @@
+flowchart LR
+  %% End-to-end pipeline:
+  %% PostCreator -> posts-topic -> HashTagCounter -> hashtags-topic -> HashTagPersister -> Cosmos DB -> UserView
+
+  %% Producers / Consumers
+  PG["PostCreator / PostGenerator\nProduces: Post events\ntext, createdAt, userId"]
+  UV["UserView\nReads trending hashtags"]
+
+  %% Kafka-style messaging (Azure Event Hubs Kafka endpoint)
+  subgraph EH1["Event Hubs Kafka endpoint\nposts-topic (3 partitions)"]
+    P0[(partition 0)]
+    P1[(partition 1)]
+    P2[(partition 2)]
+  end
+
+  subgraph EH2["Event Hubs Kafka endpoint\nhashtags-topic (3 partitions)"]
+    H0[(partition 0)]
+    H1[(partition 1)]
+    H2[(partition 2)]
+  end
+
+  %% HashTagCounter scaled by partition (consumer group assigns partitions)
+  subgraph HTC["HashTagCounter / HashtagExtractor\nConsumer Group: 1 instance per partition"]
+    C0["Instance p0\nread, extract, count\nbatch=100 swap/flush"]
+    C1["Instance p1\nread, extract, count\nbatch=100 swap/flush"]
+    C2["Instance p2\nread, extract, count\nbatch=100 swap/flush"]
+  end
+
+  HP["HashTagPersister\nConsumes HashtagCount batches\nIdempotent / at-least-once safe"]
+  DB[("Cosmos DB\nHashtag documents\nid=hashtag, count")]
+
+  %% Flow: PostCreator -> posts-topic partitions
+  PG -->|Post events| P0
+  PG -->|Post events| P1
+  PG -->|Post events| P2
+
+  %% posts-topic partitions -> HashTagCounter instances (1 partition per instance)
+  P0 -->|consume posts| C0
+  P1 -->|consume posts| C1
+  P2 -->|consume posts| C2
+
+  %% HashTagCounter instances -> hashtags-topic partitions (partitionKey=hashtag)
+  C0 -->|"HashtagCount: hashtag, count, ts\npartitionKey=hashtag"| H0
+  C1 -->|"HashtagCount: hashtag, count, ts\npartitionKey=hashtag"| H1
+  C2 -->|"HashtagCount: hashtag, count, ts\npartitionKey=hashtag"| H2
+
+  %% hashtags-topic -> HashTagPersister
+  H0 -->|consume counts| HP
+  H1 -->|consume counts| HP
+  H2 -->|consume counts| HP
+
+  %% HashTagPersister -> Cosmos DB
+  HP -->|merge/upsert counts| DB
+
+  %% UserView reads from Cosmos DB
+  UV -->|query trending hashtags| DB
+
+  %% Styling (optional)
+  classDef service fill:#dbeafe,stroke:#1d4ed8,color:#0f172a,stroke-width:1px;
+  classDef topic fill:#f3f4f6,stroke:#374151,color:#111827,stroke-width:1px;
+  classDef db fill:#dcfce7,stroke:#166534,color:#052e16,stroke-width:1px;
+
+  class PG,UV,HP,C0,C1,C2 service;
+  class P0,P1,P2,H0,H1,H2 topic;
+  class DB db;
