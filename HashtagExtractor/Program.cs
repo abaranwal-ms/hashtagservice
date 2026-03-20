@@ -94,16 +94,21 @@ static async Task HandlePostEventAsync(
         return;
     }
 
-    var hashtagEvent = new HashtagEvent
+    var extractedAt = DateTimeOffset.UtcNow;
+    foreach (var hashtag in hashtags)
     {
-        PostId      = post.Id,
-        Hashtags    = hashtags,
-        ExtractedAt = DateTimeOffset.UtcNow
-    };
+        var hashtagEvent = new HashtagEvent
+        {
+            PostId      = post.Id,
+            Hashtags    = new List<string> { hashtag },
+            ExtractedAt = extractedAt
+        };
 
-    using var batch = await producer.CreateBatchAsync(ct);
-    batch.TryAdd(new EventData(JsonSerializer.Serialize(hashtagEvent)));
-    await producer.SendAsync(batch, ct);
+        using var batch = await producer.CreateBatchAsync(
+            new CreateBatchOptions { PartitionKey = hashtag }, ct);
+        batch.TryAdd(new EventData(JsonSerializer.Serialize(hashtagEvent)));
+        await producer.SendAsync(batch, ct);
+    }
 
     Console.WriteLine($"[Partition-{args.Partition.PartitionId}] Post {post.Id} → hashtags: {string.Join(", ", hashtags)}");
 
