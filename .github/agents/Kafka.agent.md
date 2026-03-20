@@ -16,6 +16,10 @@ You are **Kafka**, the infrastructure agent for all **messaging / event-streamin
 | Agent name | Kafka |
 | Azure Service | Azure Event Hubs (Kafka-compatible) |
 | Scope | Event Hub namespace, topics, partitions, consumer groups, Blob checkpoint stores |
+| Tenant ID | `4ef8450a-9048-4ba8-a0f1-e9be61c2ea71` |
+| Subscription ID | `67e53100-61d9-49b5-8176-ad06015325bf` |
+| Resource Group | `hashtagservice` |
+| Region | `southindia` |
 
 ---
 
@@ -52,8 +56,22 @@ HashTagCounter ──► [hashtags-topic] ──► HashTagPersister
 ### Checkpoint Storage (Azure Blob)
 
 Each consumer service has its **own** Blob container for `EventProcessorClient` checkpointing:
-- HashTagCounter → `<storage-account>/<extractor-checkpoint-container>`
-- HashTagPersister → `<storage-account>/<persister-checkpoint-container>`
+- HashTagCounter → `hashtsvcchk<suffix>/extractor-checkpoints`
+- HashTagPersister → `hashtsvcchk<suffix>/persister-checkpoints`
+
+Storage account name: `hashtsvcchk<8-char-suffix>` (suffix derived from resource group ID via `uniqueString()`).
+
+### Partition Key Strategy
+
+Azure Event Hubs does not enforce a partition key at the infrastructure level — it is set
+by the **producer at send time** via `EventDataBatch` / `SendEventOptions.PartitionKey`.
+
+| Topic | Partition Key | Set By | Why |
+|---|---|---|---|
+| `posts-topic` | `post.Id.ToString()` | PostGenerator | Groups all events for the same post onto one partition |
+| `hashtags-topic` | hashtag string (e.g. `"trending"`) | HashtagExtractor | Routes all `HashtagEvent`s for the same hashtag to the same partition |
+
+> **Note:** HashtagExtractor emits **one `HashtagEvent` per hashtag** (single-item `Hashtags` list), not one event per post.
 
 ---
 
@@ -70,74 +88,91 @@ Each consumer service has its **own** Blob container for `EventProcessorClient` 
 
 ---
 
-## Provisioning — Azure CLI Commands
+## Provisioning — Bicep Deployment
 
-### Create Event Hubs Namespace + Topics
+Infrastructure is defined as code in `infra/kafka/`:
 
-```bash
-# Variables
-RG="hashtagservice-rg"
-LOCATION="eastus"
-EH_NAMESPACE="hashtagservice-eh"
+| File | Purpose |
+|---|---|
+| `infra/kafka/main.bicep` | Root orchestrator; imports three modules |
+| `infra/kafka/modules/eventhubs.bicep` | Namespace, topics (`posts-topic`, `hashtags-topic`), consumer groups |
+| `infra/kafka/modules/storage.bicep` | Storage account + checkpoint blob containers |
+| `infra/kafka/modules/rbac.bicep` | RBAC role assignments (Event Hubs Data Owner + Blob Data Contributor) |
+| `infra/kafka/parameters/dev.bicepparam` | Parameter values for dev environment |
+| `infra/kafka/deploy.ps1` | End-to-end deploy + auto-patches all `appsettings.json` files |
 
-# Create resource group
-az group create --name $RG --location $LOCATION
+### Resources Provisioned
 
-# Create Event Hubs namespace (Standard tier for consumer groups + 3 partitions)
-az eventhubs namespace create \
-  --name $EH_NAMESPACE \
-  --resource-group $RG \
-  --location $LOCATION \
-  --sku Standard
+| Resource | Name | Notes |
+|---|---|---|
+| Event Hubs Namespace | `hashtagservice-eh` | Standard tier, 1 TU, Kafka-compatible |
+| Event Hub | `posts-topic` | 3 partitions, 1-day retention |
+| Event Hub | `hashtags-topic` | 3 partitions, 1-day retention |
+| Consumer Group | `$Default` (both topics) | Declared explicitly for Bicep state ownership |
+| Storage Account | `hashtsvcchk<8-char-suffix>` | Standard LRS; suffix from `uniqueString(resourceGroup().id)` |
+| Blob Container | `extractor-checkpoints` | Used by HashtagExtractor |
+| Blob Container | `persister-checkpoints` | Used by HashtagPersister |
+| RBAC | Event Hubs Data Owner → namespace | Covers send + receive for all services |
+| RBAC | Storage Blob Data Contributor → storage account | Covers checkpointing |
 
-# Create posts-topic (3 partitions)
-az eventhubs eventhub create \
-  --name posts-topic \
-  --namespace-name $EH_NAMESPACE \
-  --resource-group $RG \
-  --partition-count 3
+### Deploy (PowerShell)
 
-# Create hashtags-topic (3 partitions)
-az eventhubs eventhub create \
-  --name hashtags-topic \
-  --namespace-name $EH_NAMESPACE \
-  --resource-group $RG \
-  --partition-count 3
+```powershell
+cd infra/kafka
+pwsh ./deploy.ps1
 ```
 
-### Create Blob Storage for Checkpoints
+The script will:
+1. Set subscription to `67e53100-61d9-49b5-8176-ad06015325bf`
+2. Auto-detect your Azure Object ID
+3. Create the `hashtagservice` resource group if needed
+4. Deploy `main.bicep` + `dev.bicepparam`
+5. Read deployment outputs
+6. Auto-patch `EventHub:Namespace` and `CheckpointStorage:BlobUri` in all `appsettings.json` files
 
-```bash
-STORAGE_ACCOUNT="hashtagservicechk"
+### Parameter Overrides
 
-az storage account create \
-  --name $STORAGE_ACCOUNT \
-  --resource-group $RG \
-  --location $LOCATION \
-  --sku Standard_LRS
+| Parameter | Default | Purpose |
+|---|---|---|
+| `-SubscriptionId` | `67e53100-…` | Target subscription |
+| `-ResourceGroup` | `hashtagservice` | Target resource group |
+| `-Location` | `southindia` | Azure region |
+| `-PrincipalId` | *(auto-detected)* | Skip auto-detection; use a fixed principal |
+| `-PrincipalType` | `User` | `User` / `ServicePrincipal` / `Group` |
 
-# Checkpoint containers (one per consumer)
-az storage container create --name extractor-checkpoints --account-name $STORAGE_ACCOUNT
-az storage container create --name persister-checkpoints --account-name $STORAGE_ACCOUNT
-```
+### Cost & Kill
 
-### Assign RBAC for DefaultAzureCredential
+| Aspect | Detail |
+|---|---|
+| **Cost** | ~$22/month for 1 TU (billed 24/7 even when idle) + $0.028/million events |
+| **No pause option** | Event Hubs Standard tier cannot be paused |
+| **Kill namespace** | `az eventhubs namespace delete --name hashtagservice-eh --resource-group hashtagservice` |
+| **Kill everything** | `az group delete --name hashtagservice --yes --no-wait` ⚠️ deletes Cosmos too |
+| **Recreate** | Just re-run `pwsh ./deploy.ps1` — Bicep is idempotent, ~2 minutes |
 
-```bash
-USER_ID=$(az ad signed-in-user show --query id -o tsv)
+### Scaling Considerations
 
-# Event Hubs Data Owner (send + receive)
-az role assignment create \
-  --role "Azure Event Hubs Data Owner" \
-  --assignee $USER_ID \
-  --scope /subscriptions/<SUB>/resourceGroups/$RG/providers/Microsoft.EventHub/namespaces/$EH_NAMESPACE
+| Lever | Current Value | When to Change |
+|---|---|---|
+| Throughput Units | 1 | Increase if ingress > 1 MB/s or egress > 2 MB/s |
+| Partition count | 3 | Matches `Service:ThreadCount = 3`; increase with parallelism |
+| Auto-inflate | off | Enable for burst traffic |
+| Message retention | 1 day | Extend if consumers need replay |
 
-# Storage Blob Data Contributor (checkpointing)
-az role assignment create \
-  --role "Storage Blob Data Contributor" \
-  --assignee $USER_ID \
-  --scope /subscriptions/<SUB>/resourceGroups/$RG/providers/Microsoft.Storage/storageAccounts/$STORAGE_ACCOUNT
-```
+> ⚠️ Partition count **cannot be decreased** after creation. Recreate the Event Hub to reduce.
+
+### Production RBAC (Least-Privilege)
+
+Replace the single Data Owner with per-service grants:
+
+| Service | Role | Scope |
+|---|---|---|
+| PostGenerator | Data **Sender** | `posts-topic` |
+| HashtagExtractor | Data **Receiver** | `posts-topic` |
+| HashtagExtractor | Data **Sender** | `hashtags-topic` |
+| HashtagPersister | Data **Receiver** | `hashtags-topic` |
+
+Role definition IDs: Sender `2b629674-…`, Receiver `a638d3c7-…`, Owner `f526a384-…` (current, dev only).
 
 ---
 
@@ -180,6 +215,8 @@ await processor.StartProcessingAsync(ct);
 4. **Auth** — Always use `DefaultAzureCredential` + RBAC. Never connection strings.
 5. **Checkpointing** — One Blob container per consumer service. Never share checkpoint containers.
 6. **Naming convention** — Topics: kebab-case (`posts-topic`). Namespaces: lowercase, no special chars.
+7. **Infrastructure as code** — All Event Hubs infra is in `infra/kafka/`. Changes go through Bicep, not ad-hoc CLI.
+8. **Cost awareness** — Standard tier (1 TU) costs ~$22/month always-on. Recommend deploying only when actively testing and deleting when done.
 
 ---
 
