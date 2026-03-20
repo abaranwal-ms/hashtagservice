@@ -1,0 +1,171 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "metadata": {
+    "_generator": {
+      "name": "bicep",
+      "version": "0.41.2.15936",
+      "templateHash": "4515187922703576023"
+    }
+  },
+  "parameters": {
+    "principalId": {
+      "type": "string",
+      "metadata": {
+        "description": "AAD object ID (managed identity or user) to assign Cosmos DB Built-in Data Contributor."
+      }
+    }
+  },
+  "resources": [
+    {
+      "type": "Microsoft.DocumentDB/databaseAccounts",
+      "apiVersion": "2024-05-15",
+      "name": "hashtagservice-cosmos",
+      "location": "centralindia",
+      "kind": "GlobalDocumentDB",
+      "properties": {
+        "databaseAccountOfferType": "Standard",
+        "consistencyPolicy": {
+          "defaultConsistencyLevel": "Session"
+        },
+        "locations": [
+          {
+            "locationName": "centralindia",
+            "failoverPriority": 0,
+            "isZoneRedundant": false
+          }
+        ],
+        "capabilities": [
+          {
+            "name": "EnableServerless"
+          }
+        ],
+        "disableLocalAuth": false
+      }
+    },
+    {
+      "type": "Microsoft.DocumentDB/databaseAccounts/sqlDatabases",
+      "apiVersion": "2024-05-15",
+      "name": "[format('{0}/{1}', 'hashtagservice-cosmos', 'HashtagServiceDb')]",
+      "properties": {
+        "resource": {
+          "id": "HashtagServiceDb"
+        }
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.DocumentDB/databaseAccounts', 'hashtagservice-cosmos')]"
+      ]
+    },
+    {
+      "type": "Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers",
+      "apiVersion": "2024-05-15",
+      "name": "[format('{0}/{1}/{2}', 'hashtagservice-cosmos', 'HashtagServiceDb', 'Hashtags')]",
+      "properties": {
+        "resource": {
+          "id": "Hashtags",
+          "partitionKey": {
+            "paths": [
+              "/hashtag"
+            ],
+            "kind": "Hash"
+          },
+          "indexingPolicy": {
+            "indexingMode": "consistent",
+            "includedPaths": [
+              {
+                "path": "/hashtag/?"
+              },
+              {
+                "path": "/postId/?"
+              },
+              {
+                "path": "/extractedAt/?"
+              }
+            ],
+            "excludedPaths": [
+              {
+                "path": "/*"
+              }
+            ]
+          }
+        }
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.DocumentDB/databaseAccounts/sqlDatabases', 'hashtagservice-cosmos', 'HashtagServiceDb')]"
+      ]
+    },
+    {
+      "type": "Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers",
+      "apiVersion": "2024-05-15",
+      "name": "[format('{0}/{1}/{2}', 'hashtagservice-cosmos', 'HashtagServiceDb', 'Posts')]",
+      "properties": {
+        "resource": {
+          "id": "Posts",
+          "partitionKey": {
+            "paths": [
+              "/partitionKey"
+            ],
+            "kind": "Hash"
+          },
+          "indexingPolicy": {
+            "indexingMode": "consistent",
+            "includedPaths": [
+              {
+                "path": "/partitionKey/?"
+              },
+              {
+                "path": "/userId/?"
+              },
+              {
+                "path": "/createdAt/?"
+              }
+            ],
+            "excludedPaths": [
+              {
+                "path": "/*"
+              }
+            ]
+          }
+        }
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.DocumentDB/databaseAccounts/sqlDatabases', 'hashtagservice-cosmos', 'HashtagServiceDb')]"
+      ]
+    },
+    {
+      "type": "Microsoft.DocumentDB/databaseAccounts/sqlRoleAssignments",
+      "apiVersion": "2024-05-15",
+      "name": "[format('{0}/{1}', 'hashtagservice-cosmos', guid(resourceId('Microsoft.DocumentDB/databaseAccounts', 'hashtagservice-cosmos'), parameters('principalId'), '00000000-0000-0000-0000-000000000002'))]",
+      "properties": {
+        "roleDefinitionId": "[format('{0}/sqlRoleDefinitions/00000000-0000-0000-0000-000000000002', resourceId('Microsoft.DocumentDB/databaseAccounts', 'hashtagservice-cosmos'))]",
+        "principalId": "[parameters('principalId')]",
+        "scope": "[resourceId('Microsoft.DocumentDB/databaseAccounts', 'hashtagservice-cosmos')]"
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.DocumentDB/databaseAccounts', 'hashtagservice-cosmos')]"
+      ]
+    }
+  ],
+  "outputs": {
+    "cosmosAccountName": {
+      "type": "string",
+      "value": "hashtagservice-cosmos"
+    },
+    "cosmosEndpoint": {
+      "type": "string",
+      "value": "[reference(resourceId('Microsoft.DocumentDB/databaseAccounts', 'hashtagservice-cosmos'), '2024-05-15').documentEndpoint]"
+    },
+    "databaseName": {
+      "type": "string",
+      "value": "HashtagServiceDb"
+    },
+    "hashtagsContainerName": {
+      "type": "string",
+      "value": "Hashtags"
+    },
+    "postsContainerName": {
+      "type": "string",
+      "value": "Posts"
+    }
+  }
+}

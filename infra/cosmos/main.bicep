@@ -7,7 +7,7 @@ param principalId string
 
 resource cosmosAccount 'Microsoft.DocumentDB/databaseAccounts@2024-05-15' = {
   name: 'hashtagservice-cosmos'
-  location: 'southindia'
+  location: 'centralindia'
   kind: 'GlobalDocumentDB'
   properties: {
     databaseAccountOfferType: 'Standard'
@@ -16,7 +16,7 @@ resource cosmosAccount 'Microsoft.DocumentDB/databaseAccounts@2024-05-15' = {
     }
     locations: [
       {
-        locationName: 'southindia'
+        locationName: 'centralindia'
         failoverPriority: 0
         isZoneRedundant: false
       }
@@ -56,8 +56,7 @@ resource container 'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/container
         indexingMode: 'consistent'
         includedPaths: [
           { path: '/hashtag/?' }
-          { path: '/postId/?' }
-          { path: '/extractedAt/?' }
+          { path: '/totalPostCount/?' }
         ]
         excludedPaths: [
           { path: '/*' }
@@ -66,6 +65,38 @@ resource container 'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/container
     }
   }
 }
+
+// ── Posts Container ───────────────────────────────────────────────────────────
+// Partition key: /id (post GUID) — enables 1 RU point reads by post ID.
+// Each post lands on its own logical partition for perfect write distribution.
+
+resource postsContainer 'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers@2024-05-15' = {
+  parent: database
+  name: 'Posts'
+  properties: {
+    resource: {
+      id: 'Posts'
+      partitionKey: {
+        paths: [ '/id' ]
+        kind: 'Hash'
+      }
+      indexingPolicy: {
+        indexingMode: 'consistent'
+        includedPaths: [
+          { path: '/userId/?' }
+          { path: '/createdAt/?' }
+        ]
+        excludedPaths: [
+          { path: '/*' }
+        ]
+      }
+    }
+  }
+}
+
+// TODO: UserPartitions reverse-index container (partition key: /userId).
+// One document per user tracking which YYYYMM buckets have post data.
+// See Shared/Models/Post.cs for the design notes.
 
 // ── RBAC: Cosmos DB Built-in Data Contributor ────────────────────────────────
 // Role definition ID 00000000-0000-0000-0000-000000000002 is the built-in
@@ -86,4 +117,5 @@ resource roleAssignment 'Microsoft.DocumentDB/databaseAccounts/sqlRoleAssignment
 output cosmosAccountName string = cosmosAccount.name
 output cosmosEndpoint string = cosmosAccount.properties.documentEndpoint
 output databaseName string = database.name
-output containerName string = container.name
+output hashtagsContainerName string = container.name
+output postsContainerName string = postsContainer.name

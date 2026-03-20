@@ -31,32 +31,79 @@ This agent owns everything related to the **data persistence layer** — Azure C
 
 | Property | Value |
 |---|---|
+| Tenant ID | `4ef8450a-9048-4ba8-a0f1-e9be61c2ea71` |
+| Subscription ID | `67e53100-61d9-49b5-8176-ad06015325bf` |
+| Resource Group | `hashtagservice` |
+| Account Name | `hashtagservice-cosmos` |
+| Region | `centralindia` |
 | API | NoSQL (document/JSON) |
+| Throughput | Serverless |
 | Consistency | Session (default) |
 | Auth | `DefaultAzureCredential` (RBAC) |
+| RBAC Principal ID | `346af360-2e13-4bbf-b7ff-47f4865ce521` |
 
 ### Database & Containers
 
 | Database | Container | Partition Key | Description |
 |---|---|---|---|
 | `HashtagServiceDb` | `Hashtags` | `/hashtag` | One document per hashtag-per-post |
+| `HashtagServiceDb` | `Posts` | `/partitionKey` | Post documents, partitioned by `{UserId}_{YYYYMM}` |
+| `HashtagServiceDb` | `UserPartitions` *(TODO)* | `/userId` | Reverse-index: tracks which months a user has post data |
 
 ### Document Schema — `Hashtags` Container
 
+One document per unique hashtag. `id` is computed from `hashtag` (they are always equal).
+Model: `Shared/Models/HashtagDocument.cs`
+
 ```json
 {
-  "id": "<unique-guid>",
-  "postId": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
-  "hashtag": "trending",
-  "extractedAt": "2026-03-21T12:00:00Z"
+  "id": "sunset",
+  "hashtag": "sunset",
+  "topPosts": [
+    { "postId": "3fa85f64-5717-4562-b3fc-2c963f66afa6", "imageUrl": "https://cdn.example.com/img/abc123.jpg" },
+    { "postId": "b2c4e8a1-1234-5678-9abc-def012345678", "imageUrl": "https://cdn.example.com/img/xyz789.jpg" }
+  ],
+  "totalPostCount": 1542
 }
 ```
 
+- `topPosts` — capped at 100 most recent post references (postId + imageUrl)
+- `totalPostCount` — total posts using this hashtag (not capped)
+
 **Partition key choice: `/hashtag`**
-- ✅ Enables efficient single-partition queries for "all posts with hashtag X"
+- ✅ Point read by hashtag = 1 RU (id == hashtag)
 - ✅ Good distribution if hashtags are diverse
 - ⚠️ Hot partitions possible for viral hashtags — acceptable for a POC
-- Alternative: `/postId` — better write distribution, but cross-partition reads for trending queries
+
+### Document Schema — `Posts` Container
+
+Model: `Shared/Models/PostDocument.cs`
+
+```json
+{
+  "id": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+  "userId": "user42",
+  "url": "https://cdn.example.com/img/abc123.jpg",
+  "text": "Check out this #sunset over the #mountains",
+  "createdAt": "2026-03-21T12:00:00Z"
+}
+```
+
+**Partition key choice: `/id`** (post GUID)
+- ✅ Point read by post ID = 1 RU
+- ✅ Perfect write distribution — every post on its own partition
+- ✅ Simplest design — no synthetic keys
+
+### Document Schema — `UserPartitions` Container *(TODO)*
+
+```json
+{
+  "id": "<userId>",
+  "userId": "user42",
+  "partitions": ["202601", "202602", "202603"],
+  "partitionCount": 3
+}
+```
 
 ---
 
@@ -75,55 +122,35 @@ HashTagCounter ──► [hashtags-topic] ──► HashTagPersister ──► C
 
 ---
 
-## Provisioning — Azure CLI Commands
+## Provisioning — Bicep Deployment
 
-### Create Cosmos DB Account + Database + Container
+Infrastructure is defined as code in `infra/cosmos/`:
 
-```bash
-# Variables
-RG="hashtagservice-rg"
-LOCATION="eastus"
-COSMOS_ACCOUNT="hashtagservice-cosmos"
-DB_NAME="HashtagServiceDb"
-CONTAINER_NAME="Hashtags"
+| File | Purpose |
+|---|---|
+| `infra/cosmos/main.bicep` | Cosmos DB account, database, container, RBAC role assignment |
+| `infra/cosmos/main.bicepparam` | Parameters (principalId for RBAC) |
+| `infra/cosmos/deploy.ps1` | PowerShell deploy script (login + deploy) |
+| `infra/cosmos/deploy.sh` | Bash deploy script (login + deploy) |
 
-# Create Cosmos DB account (NoSQL API, serverless for POC)
-az cosmosdb create \
-  --name $COSMOS_ACCOUNT \
-  --resource-group $RG \
-  --locations regionName=$LOCATION \
-  --capabilities EnableServerless
+### Deploy (PowerShell)
 
-# Create database
-az cosmosdb sql database create \
-  --account-name $COSMOS_ACCOUNT \
-  --resource-group $RG \
-  --name $DB_NAME
-
-# Create container with partition key /hashtag
-az cosmosdb sql container create \
-  --account-name $COSMOS_ACCOUNT \
-  --resource-group $RG \
-  --database-name $DB_NAME \
-  --name $CONTAINER_NAME \
-  --partition-key-path "/hashtag"
+```powershell
+.\infra\cosmos\deploy.ps1
 ```
 
-### Assign RBAC for DefaultAzureCredential
+### Deploy (Bash)
 
 ```bash
-USER_ID=$(az ad signed-in-user show --query id -o tsv)
-COSMOS_SCOPE="/subscriptions/<SUB>/resourceGroups/$RG/providers/Microsoft.DocumentDB/databaseAccounts/$COSMOS_ACCOUNT"
-
-# Built-in role: Cosmos DB Built-in Data Contributor
-# (read + write; use "Cosmos DB Built-in Data Reader" for UserView)
-az cosmosdb sql role assignment create \
-  --account-name $COSMOS_ACCOUNT \
-  --resource-group $RG \
-  --role-definition-name "Cosmos DB Built-in Data Contributor" \
-  --principal-id $USER_ID \
-  --scope "/"
+bash infra/cosmos/deploy.sh
 ```
+
+The Bicep template creates:
+- Cosmos DB serverless account (`hashtagservice-cosmos`) in `centralindia`
+- Database `HashtagServiceDb`
+- Container `Hashtags` with partition key `/hashtag` and targeted indexing
+- Container `Posts` with partition key `/id` and targeted indexing
+- RBAC assignment: Cosmos DB Built-in Data Contributor (role `00000000-0000-0000-0000-000000000002`)
 
 ---
 
@@ -144,40 +171,55 @@ var container = cosmosClient.GetContainer(
 ### Write (HashTagPersister)
 
 ```csharp
-// Upsert for idempotency — same doc ID won't create duplicates
-await container.UpsertItemAsync(document, new PartitionKey(document.Hashtag));
+// Upsert hashtag document — read-modify-write to append to topPosts
+await hashtagsContainer.UpsertItemAsync(hashtagDoc, new PartitionKey(hashtagDoc.Hashtag));
+
+// Upsert post document — point write, partition key = id
+await postsContainer.UpsertItemAsync(postDoc, new PartitionKey(postDoc.Id));
 ```
 
 ### Read / Query (UserView)
 
 ```csharp
-// Single-partition read: all posts for a specific hashtag
-var query = new QueryDefinition("SELECT c.postId, c.extractedAt FROM c WHERE c.hashtag = @tag")
-    .WithParameter("@tag", hashtag);
+// Point read: get a hashtag document (1 RU)
+var response = await hashtagsContainer.ReadItemAsync<HashtagDocument>(
+    hashtag, new PartitionKey(hashtag));
 
-using var iterator = container.GetItemQueryIterator<dynamic>(query,
-    requestOptions: new QueryRequestOptions { PartitionKey = new PartitionKey(hashtag) });
+// Point read: get a post by ID (1 RU)
+var post = await postsContainer.ReadItemAsync<PostDocument>(
+    postId, new PartitionKey(postId));
 
-// Cross-partition aggregation: trending hashtags
+// Trending hashtags: top N by totalPostCount (cross-partition)
 var trendingQuery = new QueryDefinition(
-    "SELECT c.hashtag, COUNT(1) AS postCount FROM c GROUP BY c.hashtag");
-
-using var trendingIterator = container.GetItemQueryIterator<dynamic>(trendingQuery);
+    "SELECT c.hashtag, c.totalPostCount FROM c ORDER BY c.totalPostCount DESC OFFSET 0 LIMIT @top")
+    .WithParameter("@top", top);
 ```
 
 ---
 
 ## Indexing Policy
 
-Default Cosmos indexing is fine for the POC. For production, consider:
-
+### Hashtags Container
 ```json
 {
   "indexingMode": "consistent",
   "includedPaths": [
     { "path": "/hashtag/?" },
-    { "path": "/postId/?" },
-    { "path": "/extractedAt/?" }
+    { "path": "/totalPostCount/?" }
+  ],
+  "excludedPaths": [
+    { "path": "/*" }
+  ]
+}
+```
+
+### Posts Container
+```json
+{
+  "indexingMode": "consistent",
+  "includedPaths": [
+    { "path": "/userId/?" },
+    { "path": "/createdAt/?" }
   ],
   "excludedPaths": [
     { "path": "/*" }
@@ -213,8 +255,24 @@ If the user asks, be ready to discuss:
 
 | Decision | Options | Current Choice |
 |---|---|---|
-| Partition key | `/hashtag` vs `/postId` vs `/id` | `/hashtag` |
-| Document granularity | One doc per hashtag-per-post vs one doc per HashtagEvent | One per hashtag-per-post |
+| Decision | Options | Current Choice |
+|---|---|---|
+| Partition key (`Hashtags`) | `/hashtag` vs `/id` | `/hashtag` |
+| Partition key (`Posts`) | `/id` vs `/partitionKey` (userId_YYYYMM) | `/id` (post GUID) |
+| Hashtag doc granularity | One doc per hashtag (aggregated) vs one per hashtag-per-post | One per hashtag (aggregated, topPosts capped at 100) |
 | Throughput model | Serverless vs provisioned RUs | Serverless (POC) |
 | Consistency level | Strong / Bounded / Session / Eventual | Session |
 | TTL | No TTL vs auto-expire old data | No TTL (POC) |
+
+---
+
+## Creation Log
+
+| Date | Action | Details |
+|---|---|---|
+| 2026-03-21 | Account created | `hashtagservice-cosmos` — serverless, `centralindia`, Session consistency |
+| 2026-03-21 | Database created | `HashtagServiceDb` |
+| 2026-03-21 | Container created | `Hashtags` — partition key `/hashtag`, targeted indexing (`/hashtag/?`, `/totalPostCount/?`) |
+| 2026-03-21 | Container created | `Posts` — partition key `/id`, targeted indexing (`/userId/?`, `/createdAt/?`) |
+| 2026-03-21 | RBAC assigned | Cosmos DB Built-in Data Contributor → principal `346af360-2e13-4bbf-b7ff-47f4865ce521` |
+| — | TODO | `UserPartitions` container — reverse-index (partition key `/userId`) |
