@@ -1,6 +1,7 @@
 <Solution>
   <Project Path="HashtagExtractor/HashtagExtractor.csproj" />
   <Project Path="HashtagPersister/HashtagPersister.csproj" />
+  <Project Path="PostGenerator.Tests/PostGenerator.Tests.csproj" />
   <Project Path="PostGenerator/PostGenerator.csproj" />
   <Project Path="Shared.Tests/Shared.Tests.csproj" />
   <Project Path="Shared/Shared.csproj" />

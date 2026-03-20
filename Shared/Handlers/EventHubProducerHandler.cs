@@ -9,9 +9,18 @@ using System.Threading.Tasks;
 namespace HashtagService.Shared.Handlers;
 
 /// <summary>
+/// Interface for sending events to an Event Hub.
+/// </summary>
+public interface IEventHubProducerHandler
+{
+    Task SendEventAsync<T>(T payload, string? partitionKey = null, CancellationToken cancellationToken = default);
+    Task SendEventsBatchAsync<T>(IEnumerable<T> payloads, string? partitionKey = null, CancellationToken cancellationToken = default);
+}
+
+/// <summary>
 /// Simple handler for sending events to an Event Hub.
 /// </summary>
-public class EventHubProducerHandler
+public class EventHubProducerHandler : IEventHubProducerHandler
 {
     private readonly EventHubProducerClient _producerClient;
 

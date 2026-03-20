@@ -5,10 +5,22 @@ using HashtagService.Shared.Models;
 namespace HashtagService.Shared.Handlers;
 
 /// <summary>
+/// Interface for Cosmos DB entity handler for <see cref="PostDocument"/> in the Posts container.
+/// </summary>
+public interface IPostDocumentHandler
+{
+    Task<PostDocument> InsertAsync(PostDocument doc, CancellationToken ct = default);
+    Task<PostDocument> UpdateAsync(PostDocument doc, CancellationToken ct = default);
+    Task<PostDocument?> GetAsync(string postId, CancellationToken ct = default);
+    Task<PostDocument> SoftDeleteAsync(string postId, CancellationToken ct = default);
+    Task HardDeleteAsync(string postId, CancellationToken ct = default);
+}
+
+/// <summary>
 /// Cosmos DB entity handler for <see cref="PostDocument"/> in the Posts container.
 /// Partition key: /id (post GUID).
 /// </summary>
-public class PostDocumentHandler
+public class PostDocumentHandler : IPostDocumentHandler
 {
     private readonly Container _container;
 
