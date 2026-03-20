@@ -94,6 +94,9 @@ static async Task HandlePostEventAsync(
         return;
     }
 
+    // One send per hashtag is intentional: each hashtag is a distinct partition key,
+    // so events for different hashtags cannot share a batch.  Grouping by key within
+    // a single-post handler would yield the same N sends for N distinct hashtags.
     var extractedAt = DateTimeOffset.UtcNow;
     foreach (var hashtag in hashtags)
     {

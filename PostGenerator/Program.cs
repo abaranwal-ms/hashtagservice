@@ -44,6 +44,9 @@ static async Task ProduceAsync(
     {
         int sent = 0;
 
+        // One send per post is intentional: every post has a unique Id, so events
+        // cannot share a partition key and therefore cannot be combined into a
+        // single batch.  The per-event overhead is acceptable at dev-scale throughput.
         for (int i = 0; i < batchSize; i++)
         {
             var post    = PostFactory.Create(rng);
