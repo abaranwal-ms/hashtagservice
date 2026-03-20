@@ -1,6 +1,6 @@
 ---
 description: "Agent for Database infrastructure. Manages Azure Cosmos DB provisioning, container design, partition keys, indexing, and query patterns."
-agent: "agent"
+tools: ["codebase", "editFiles", "readFile", "runCommands", "problems", "fetch"]
 ---
 
 # Database Agent

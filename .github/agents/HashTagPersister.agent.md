@@ -1,6 +1,6 @@
 ---
 description: "Agent for the HashTagPersister service. Reads HashtagEvents from Event Hubs and writes hashtag data to Azure Cosmos DB."
-agent: "agent"
+tools: ["codebase", "editFiles", "readFile", "runCommands", "problems", "testFailure"]
 ---
 
 # HashTagPersister Agent

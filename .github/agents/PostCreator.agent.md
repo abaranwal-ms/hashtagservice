@@ -1,6 +1,6 @@
 ---
 description: "Agent for the PostCreator service (PostGenerator project). Generates fake social-media posts and publishes them to Event Hubs."
-agent: "agent"
+tools: ["codebase", "editFiles", "readFile", "runCommands", "problems", "testFailure"]
 ---
 
 # PostCreator Agent

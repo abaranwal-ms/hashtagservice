@@ -1,6 +1,6 @@
 ---
 description: "Agent for Kafka/Event Hubs infrastructure. Manages topics, partitions, consumer groups, checkpoint storage, and Azure Event Hubs provisioning."
-agent: "agent"
+tools: ["codebase", "editFiles", "readFile", "runCommands", "problems", "fetch"]
 ---
 
 # Kafka Agent

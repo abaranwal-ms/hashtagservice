@@ -1,6 +1,6 @@
 ---
 description: "Agent for the UserView service (NEW). A query/API layer that reads hashtag data from Cosmos DB and exposes trending-hashtag endpoints."
-agent: "agent"
+tools: ["codebase", "editFiles", "readFile", "runCommands", "problems", "testFailure"]
 ---
 
 # UserView Agent

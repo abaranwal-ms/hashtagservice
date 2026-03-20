@@ -1,6 +1,6 @@
 ---
 description: "Agent for the HashTagCounter service (HashtagExtractor project). Reads posts from Event Hubs, extracts and counts hashtags, publishes HashtagEvents."
-agent: "agent"
+tools: ["codebase", "editFiles", "readFile", "runCommands", "problems", "testFailure"]
 ---
 
 # HashTagCounter Agent
