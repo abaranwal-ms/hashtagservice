@@ -45,6 +45,8 @@ resource postsTopic 'Microsoft.EventHub/namespaces/eventhubs@2021-11-01' = {
   properties: {
     partitionCount: 3              // matches Service:ThreadCount = 3 in PostGenerator
     messageRetentionInDays: 1      // minimum; extend if replay is needed
+    // Partition key (set by producer): post.Id.ToString()
+    // → guarantees all events for the same Post land on the same partition.
   }
 }
 
@@ -57,6 +59,9 @@ resource hashtagsTopic 'Microsoft.EventHub/namespaces/eventhubs@2021-11-01' = {
   properties: {
     partitionCount: 3
     messageRetentionInDays: 1
+    // Partition key (set by producer): hashtag string (e.g. "trending")
+    // → guarantees all HashtagEvents for the same hashtag land on the same partition,
+    //   enabling stateful per-partition counting by HashTagCounter.
   }
 }
 

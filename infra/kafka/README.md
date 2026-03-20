@@ -40,6 +40,25 @@ infra/
 
 ---
 
+## Partition key strategy
+
+Azure Event Hubs does not enforce a partition key at the infrastructure level — it is set
+by the **producer at send time** via `EventDataBatch` / `SendEventOptions.PartitionKey`.
+
+| Topic | Partition key | Set by | Why |
+|---|---|---|---|
+| `posts-topic` | `post.Id.ToString()` | PostGenerator | Groups all events for the same post onto one partition |
+| `hashtags-topic` | hashtag string (e.g. `"trending"`) | HashtagExtractor | Routes all `HashtagEvent`s for the same hashtag to the same partition, enabling stateful per-partition counting |
+
+Both topics have **3 partitions**, matching `Service:ThreadCount = 3` so that one
+`EventProcessorClient` thread owns exactly one partition.
+
+> **Note:** HashtagExtractor emits **one `HashtagEvent` per hashtag** (a single-item
+> `Hashtags` list), not one event per post. This keeps the partition key semantics clean —
+> each event on `hashtags-topic` carries exactly one hashtag string as its key.
+
+---
+
 ## Prerequisites
 
 | Tool | Minimum version | Install |
