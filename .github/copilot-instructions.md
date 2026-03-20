@@ -57,10 +57,10 @@
 | Folder / .csproj | Agent Name | Notes |
 |---|---|---|
 | `PostGenerator/` | **PostCreator** | Name in code is PostGenerator |
-| `HashtagExtractor/` | **HashTagCounter** | Will be refactored to also count |
+| `HashtagExtractor/` | **HashTagCounter** | Extracts & counts hashtags (double-buffer pattern) |
 | `HashtagPersister/` | **HashTagPersister** | Stub — needs full implementation |
 | `UserView/` | **UserView** | Not yet created |
-| `Shared/` | (shared by all) | Models: `Post`, `HashtagEvent` |
+| `Shared/` | (shared by all) | Models: `Post`, `HashtagEvent`, `HashtagCount` |
 
 ## Azure Services
 
