@@ -9,5 +9,6 @@ using '../main.bicep'
 
 param location      = 'southindia'
 param ehNamespaceName = 'hashtagservice-eh'
+param principalId   = ''  // overridden at deploy time by deploy.ps1
 param principalType = 'User'
 param environmentTag = 'dev'

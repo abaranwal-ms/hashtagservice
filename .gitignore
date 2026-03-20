@@ -25,3 +25,6 @@ Thumbs.db
 [Rr]elease/
 x64/
 x86/
+
+# Azurite local storage emulator
+__azurite_db_*
