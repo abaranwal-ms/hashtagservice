@@ -5,4 +5,4 @@ using './main.bicep'
 //   az ad signed-in-user show --query id -o tsv          # for your own user
 //   az identity show -n <name> -g <rg> --query principalId -o tsv  # for a managed identity
 // )
-param principalId = ''
+param principalId = '346af360-2e13-4bbf-b7ff-47f4865ce521'
