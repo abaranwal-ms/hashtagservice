@@ -42,19 +42,24 @@ static async Task ProduceAsync(
 
     while (!ct.IsCancellationRequested)
     {
-        using var batch = await producer.CreateBatchAsync(ct);
+        int sent = 0;
 
+        // One send per post is intentional: every post has a unique Id, so events
+        // cannot share a partition key and therefore cannot be combined into a
+        // single batch.  The per-event overhead is acceptable at dev-scale throughput.
         for (int i = 0; i < batchSize; i++)
         {
-            var post = PostFactory.Create(rng);
-            var json = JsonSerializer.Serialize(post);
-            if (!batch.TryAdd(new EventData(json)))
-                break;
+            var post    = PostFactory.Create(rng);
+            var json    = JsonSerializer.Serialize(post);
+            var options = new CreateBatchOptions { PartitionKey = post.Id.ToString() };
+            using var batch = await producer.CreateBatchAsync(options, ct);
+            batch.TryAdd(new EventData(json));
+            await producer.SendAsync(batch, ct);
+            sent++;
         }
 
-        await producer.SendAsync(batch, ct);
-        total += batch.Count;
-        Console.WriteLine($"[Thread-{threadId:D2}] Sent batch of {batch.Count} posts (total: {total})");
+        total += sent;
+        Console.WriteLine($"[Thread-{threadId:D2}] Sent batch of {sent} posts (total: {total})");
 
         await Task.Delay(intervalMs, ct);
     }
