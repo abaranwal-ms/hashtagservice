@@ -169,9 +169,7 @@ az group delete --name hashtagservice --yes --no-wait
 
 ```powershell
 pwsh ./infra/cleanup.ps1                       # interactive menu
-pwsh ./infra/cleanup.ps1 -Target Checkpoints   # reset consumer offsets only
 pwsh ./infra/cleanup.ps1 -Target Messaging     # checkpoints + delete EH namespace (clean restart)
-pwsh ./infra/cleanup.ps1 -Target EventHubs     # delete EH namespace (~$22/month savings)
 pwsh ./infra/cleanup.ps1 -Target All -Force    # delete everything, skip prompts
 ```
 

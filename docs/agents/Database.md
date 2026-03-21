@@ -204,7 +204,6 @@ az group delete --name hashtagservice --yes --no-wait
 
 ```powershell
 pwsh ./infra/cleanup.ps1                    # interactive menu
-pwsh ./infra/cleanup.ps1 -Target Cosmos     # delete Cosmos DB account only
 pwsh ./infra/cleanup.ps1 -Target Messaging  # reset checkpoints + delete Event Hubs
 pwsh ./infra/cleanup.ps1 -Target All -Force # delete everything, skip prompts
 ```
