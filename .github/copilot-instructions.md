@@ -14,7 +14,7 @@
 | **PostCreator** | `#PostCreator` | [docs/agents/PostCreator.md](../docs/agents/PostCreator.md) | PostGenerator project — fake social-post producer |
 | **HashTagCounter** | `#HashTagCounter` | [docs/agents/HashTagCounter.md](../docs/agents/HashTagCounter.md) | HashtagExtractor project — extracts & counts hashtags |
 | **HashTagPersister** | `#HashTagPersister` | [docs/agents/HashTagPersister.md](../docs/agents/HashTagPersister.md) | HashtagPersister project — writes hashtag data to Cosmos DB |
-| **UserView** | `#UserView` | [docs/agents/UserView.md](../docs/agents/UserView.md) | UserView project (NEW) — query API for trending hashtags |
+| **UserView** | `#UserView` | [docs/agents/UserView.md](../docs/agents/UserView.md) | UserView project — query API for trending hashtags |
 
 ### Infrastructure Agents
 
@@ -31,25 +31,11 @@
 ## Architecture Overview
 
 ```
-                                   Azure Event Hubs (3 partitions each)
-                                   ┌──────────────┐    ┌──────────────────┐
-  PostCreator ─── N threads ──────►│  posts-topic  │───►│  HashTagCounter  │
-  (PostGenerator/)                 └──────────────┘    │  (HashtagExtractor/)
-                                                       └────────┬─────────┘
-                                                                │
-                                                       ┌────────▼─────────┐
-                                                       │  hashtags-topic  │
-                                                       └────────┬─────────┘
-                                                                │
-                                                       ┌────────▼─────────┐
-                                                       │ HashTagPersister │──► Azure Cosmos DB
-                                                       │ (HashtagPersister/)   (document DB, partitioned)
-                                                       └──────────────────┘
-                                                                │
-                                                       ┌────────▼─────────┐
-                                                       │    UserView      │◄── reads from Cosmos DB
-                                                       │   (UserView/)         (query / trending API)
-                                                       └──────────────────┘
+PostGenerator ──► posts-topic ──► HashtagExtractor ──► hashtags-topic ──► HashtagPersister ──► Cosmos DB
+   (fake posts)                    (extract + count)                       (merge upsert)        ▲
+                                                                                                 │
+                                                                                            UserView API
+                                                                                          (localhost:5100)
 ```
 
 ## Project ↔ Agent Name Mapping
@@ -59,7 +45,7 @@
 | `PostGenerator/` | **PostCreator** | Name in code is PostGenerator |
 | `HashtagExtractor/` | **HashTagCounter** | Extracts & counts hashtags (double-buffer pattern) |
 | `HashtagPersister/` | **HashTagPersister** | Stub — needs full implementation |
-| `UserView/` | **UserView** | Not yet created |
+| `UserView/` | **UserView** | Read-only Minimal API — trending, search, post lookup |
 | `Shared/` | (shared by all) | Models: `Post`, `HashtagEvent`, `HashtagCount` |
 
 ## Azure Services
