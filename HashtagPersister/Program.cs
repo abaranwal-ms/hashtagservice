@@ -48,6 +48,7 @@ var storageClient = new BlobContainerClient(new Uri(checkpointUri), new DefaultA
 
 // Per-partition counters for checkpoint batching
 var checkpointCounters = new ConcurrentDictionary<string, int>();
+var processedCounters  = new ConcurrentDictionary<string, long>();
 
 // EventProcessorClient: reads all partitions of hashtags-topic,
 // auto-balanced across instances via consumer group.
@@ -84,16 +85,19 @@ processor.ProcessEventAsync += async args =>
         doc.TotalPostCount += hashtagCount.Count;
         await hashtagHandler.UpdateAsync(doc, cts.Token);
 
-        // Checkpoint every N events per partition to amortise Blob Storage writes
         var pid = args.Partition.PartitionId;
+        var total = processedCounters.AddOrUpdate(pid, 1, (_, c) => c + 1);
+
+        // Checkpoint every N events per partition to amortise Blob Storage writes
         var counter = checkpointCounters.AddOrUpdate(pid, 1, (_, c) => c + 1);
         if (counter >= checkpointInterval)
         {
             await args.UpdateCheckpointAsync(cts.Token);
             checkpointCounters[pid] = 0;
+            Console.WriteLine($"[Partition-{pid}] Checkpoint at {total} events — last: #{hashtagCount.Hashtag} (+{hashtagCount.Count})");
         }
     }
-    catch (OperationCanceledException) { throw; }
+    catch (OperationCanceledException) { return; }
     catch (CosmosException ex)
     {
         Console.Error.WriteLine(
@@ -113,7 +117,15 @@ processor.ProcessErrorAsync += args =>
     return Task.CompletedTask;
 };
 
-await processor.StartProcessingAsync(cts.Token);
+try
+{
+    await processor.StartProcessingAsync();
+}
+catch (Exception ex)
+{
+    Console.Error.WriteLine($"[HashtagPersister] Failed to start processor: {ex}");
+    return;
+}
 Console.WriteLine("[HashtagPersister] Processor started. Press Ctrl+C to stop.");
 
 try { await Task.Delay(Timeout.Infinite, cts.Token); }

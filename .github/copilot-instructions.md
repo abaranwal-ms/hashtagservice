@@ -44,7 +44,7 @@ PostGenerator ──► posts-topic ──► HashtagExtractor ──► hashtag
 |---|---|---|
 | `PostGenerator/` | **PostCreator** | Name in code is PostGenerator |
 | `HashtagExtractor/` | **HashTagCounter** | Extracts & counts hashtags (double-buffer pattern) |
-| `HashtagPersister/` | **HashTagPersister** | Stub — needs full implementation |
+| `HashtagPersister/` | **HashTagPersister** | Event Hubs consumer → Cosmos DB merge upsert |
 | `UserView/` | **UserView** | Read-only Minimal API — trending, search, post lookup |
 | `Shared/` | (shared by all) | Models: `Post`, `HashtagEvent`, `HashtagCount` |
 
@@ -75,6 +75,14 @@ public class HashtagEvent
     public Guid PostId { get; set; }
     public List<string> Hashtags { get; set; }
     public DateTimeOffset ExtractedAt { get; set; }
+}
+
+// HashtagCount.cs
+public class HashtagCount
+{
+    public string Hashtag { get; set; }           // lowercase, e.g. "dotnet"
+    public long Count { get; set; }                // aggregated count for a batch
+    public DateTimeOffset Timestamp { get; set; }  // when this batch was produced
 }
 ```
 
