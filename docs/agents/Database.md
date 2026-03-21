@@ -157,6 +157,58 @@ The Bicep template creates:
 - Container `Posts` with partition key `/id` and targeted indexing
 - RBAC assignment: Cosmos DB Built-in Data Contributor (role `00000000-0000-0000-0000-000000000002`)
 
+### Cost & Kill
+
+| Aspect | Detail |
+|---|---|
+| **Idle cost** | **$0** — Serverless mode has no idle charge. You pay only per RU consumed + per GB stored ($0.25/GB/month). If no requests are made, the only cost is storage. |
+| **Storage cost** | ~$0.25/GB/month for data + index. Negligible for POC volumes. |
+| **RU cost** | $0.282 per 1 million RU consumed. Point reads = 1 RU each. |
+| **Max throughput** | Serverless caps at 5,000 RU/s burst. Switch to provisioned if you need more. |
+| **Safe to leave running** | ✅ Yes — unlike Event Hubs, an idle serverless Cosmos account costs virtually nothing. |
+
+**Cleanup Commands (least to most destructive):**
+
+```powershell
+# 1. Delete all documents in a container (keeps container + account)
+#    Use Cosmos Data Explorer in Azure Portal → "Delete all items"
+
+# 2. Delete a single container (keeps account + database)
+az cosmosdb sql container delete `
+  --account-name hashtagservice-cosmos `
+  --database-name HashtagServiceDb `
+  --name Hashtags `
+  --resource-group hashtagservice `
+  --yes
+
+# 3. Delete the database (keeps account)
+az cosmosdb sql database delete `
+  --account-name hashtagservice-cosmos `
+  --name HashtagServiceDb `
+  --resource-group hashtagservice `
+  --yes
+
+# 4. Delete the entire Cosmos account (~5 min)
+az cosmosdb delete `
+  --name hashtagservice-cosmos `
+  --resource-group hashtagservice `
+  --yes
+
+# 5. Delete everything (⚠️ also deletes Event Hubs + Blob storage)
+az group delete --name hashtagservice --yes --no-wait
+```
+
+**Recreate:** Re-run `pwsh ./infra/cosmos/deploy.ps1` — Bicep is idempotent, ~3 minutes.
+
+**Or use the cleanup script** (interactive menu or pass `-Target`):
+
+```powershell
+pwsh ./infra/cleanup.ps1                    # interactive menu
+pwsh ./infra/cleanup.ps1 -Target Cosmos     # delete Cosmos DB account only
+pwsh ./infra/cleanup.ps1 -Target Messaging  # reset checkpoints + delete Event Hubs
+pwsh ./infra/cleanup.ps1 -Target All -Force # delete everything, skip prompts
+```
+
 ---
 
 ## SDK Patterns Used in This Repo

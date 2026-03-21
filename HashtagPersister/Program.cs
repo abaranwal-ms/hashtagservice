@@ -8,6 +8,7 @@ using Microsoft.Azure.Cosmos;
 using Microsoft.Extensions.Configuration;
 using System.Collections.Concurrent;
 using System.Text.Json;
+using HashtagPersister;
 
 var config = new ConfigurationBuilder()
     .SetBasePath(AppContext.BaseDirectory)
@@ -21,12 +22,14 @@ var checkpointUri         = config["CheckpointStorage:BlobUri"]!;
 var cosmosEndpoint        = config["CosmosDb:Endpoint"]!;
 var cosmosDatabaseName    = config["CosmosDb:DatabaseName"]!;
 var hashtagsContainerName = config["CosmosDb:HashtagsContainerName"]!;
-int checkpointInterval    = int.Parse(config["Service:CheckpointInterval"] ?? "10");
+int batchSize             = int.Parse(config["Service:BatchSize"] ?? "50");
+int maxBatchSize          = int.Parse(config["Service:MaxBatchSize"] ?? "250");
+int maxFlushConcurrency   = int.Parse(config["Service:MaxFlushConcurrency"] ?? "5");
 
 Console.WriteLine($"[HashtagPersister] Namespace:  {ehNamespace}");
 Console.WriteLine($"[HashtagPersister] Topic:      {hashtagsTopic}");
 Console.WriteLine($"[HashtagPersister] Cosmos:     {cosmosEndpoint} / {cosmosDatabaseName} / {hashtagsContainerName}");
-Console.WriteLine($"[HashtagPersister] Checkpoint every {checkpointInterval} event(s)");
+Console.WriteLine($"[HashtagPersister] Batch:      {batchSize} events (swap), max {maxBatchSize} (hard block)");
 
 using var cts = new CancellationTokenSource();
 Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
@@ -46,9 +49,13 @@ var hashtagHandler = new HashtagDocumentHandler(hashtagsContainer);
 // Blob storage for distributed checkpointing
 var storageClient = new BlobContainerClient(new Uri(checkpointUri), new DefaultAzureCredential());
 
-// Per-partition counters for checkpoint batching
-var checkpointCounters = new ConcurrentDictionary<string, int>();
-var processedCounters  = new ConcurrentDictionary<string, long>();
+// Per-partition double-buffer: reader accumulates into read dict,
+// background writer flushes write dict to Cosmos concurrently.
+var partitionBuffers = new ConcurrentDictionary<string, PartitionBuffer>();
+
+PartitionBuffer GetOrCreateBuffer(string partitionId)
+    => partitionBuffers.GetOrAdd(partitionId, pid =>
+        new PartitionBuffer(pid, hashtagHandler, batchSize, maxBatchSize, maxFlushConcurrency));
 
 // EventProcessorClient: reads all partitions of hashtags-topic,
 // auto-balanced across instances via consumer group.
@@ -78,35 +85,22 @@ processor.ProcessEventAsync += async args =>
 
     try
     {
-        // Read-modify-write: fetch existing doc or create new, increment count, upsert
-        var doc = await hashtagHandler.GetAsync(hashtagCount.Hashtag, cts.Token)
-            ?? new HashtagDocument { Hashtag = hashtagCount.Hashtag };
+        var buf = GetOrCreateBuffer(args.Partition.PartitionId);
 
-        doc.TotalPostCount += hashtagCount.Count;
-        await hashtagHandler.UpdateAsync(doc, cts.Token);
-
-        var pid = args.Partition.PartitionId;
-        var total = processedCounters.AddOrUpdate(pid, 1, (_, c) => c + 1);
-
-        // Checkpoint every N events per partition to amortise Blob Storage writes
-        var counter = checkpointCounters.AddOrUpdate(pid, 1, (_, c) => c + 1);
-        if (counter >= checkpointInterval)
-        {
-            await args.UpdateCheckpointAsync(cts.Token);
-            checkpointCounters[pid] = 0;
-            Console.WriteLine($"[Partition-{pid}] Checkpoint at {total} events — last: #{hashtagCount.Hashtag} (+{hashtagCount.Count})");
-        }
+        // Accumulate into read dict; swap + background flush happens inside
+        // when BatchSize is reached. Checkpoint func is captured here and
+        // called by the writer *after* Cosmos writes complete.
+        await buf.AccumulateAsync(
+            hashtagCount.Hashtag,
+            hashtagCount.Count,
+            ct => args.UpdateCheckpointAsync(ct),
+            cts.Token);
     }
     catch (OperationCanceledException) { return; }
-    catch (CosmosException ex)
-    {
-        Console.Error.WriteLine(
-            $"[HashtagPersister] Cosmos error for '{hashtagCount.Hashtag}': {ex.StatusCode} — {ex.Message}");
-    }
     catch (Exception ex)
     {
         Console.Error.WriteLine(
-            $"[HashtagPersister] Error persisting '{hashtagCount.Hashtag}': {ex.Message}");
+            $"[HashtagPersister] Error processing '{hashtagCount.Hashtag}': {ex.Message}");
     }
 };
 
@@ -134,5 +128,18 @@ catch (OperationCanceledException) { }
 Console.WriteLine("[HashtagPersister] Shutting down...");
 await processor.StopProcessingAsync();
 
-// Final checkpoint for each partition so we don't re-process on restart
+// Flush any remaining read buffers (waits for in-progress writers first)
+foreach (var (pid, buf) in partitionBuffers)
+{
+    try
+    {
+        await buf.FlushRemainingAsync(CancellationToken.None);
+    }
+    catch (Exception ex)
+    {
+        Console.Error.WriteLine(
+            $"[HashtagPersister] Error during final flush of partition {pid}: {ex.Message}");
+    }
+}
+
 Console.WriteLine("[HashtagPersister] Stopped.");

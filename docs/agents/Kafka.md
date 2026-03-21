@@ -140,10 +140,76 @@ The script will:
 | Aspect | Detail |
 |---|---|
 | **Cost** | ~$22/month for 1 TU (billed 24/7 even when idle) + $0.028/million events |
-| **No pause option** | Event Hubs Standard tier cannot be paused |
-| **Kill namespace** | `az eventhubs namespace delete --name hashtagservice-eh --resource-group hashtagservice` |
-| **Kill everything** | `az group delete --name hashtagservice --yes --no-wait` ⚠️ deletes Cosmos too |
-| **Recreate** | Just re-run `pwsh ./deploy.ps1` — Bicep is idempotent, ~2 minutes |
+| **No pause option** | Event Hubs Standard tier cannot be paused or stopped |
+| **Idle cost** | ⚠️ **$22/month even with zero events** — the TU is billed continuously. Delete when not testing. |
+| **Checkpoint storage** | ~$0.02/month — negligible, safe to leave running |
+
+**Cleanup Commands (least to most destructive):**
+
+```powershell
+# 1. Delete just the Event Hubs namespace (stops the $22/month charge)
+#    Keeps the storage account + checkpoint blobs intact
+az eventhubs namespace delete `
+  --name hashtagservice-eh `
+  --resource-group hashtagservice
+
+# 2. Delete the checkpoint storage account (optional, ~$0.02/month)
+az storage account delete `
+  --name (az storage account list --resource-group hashtagservice --query "[0].name" -o tsv) `
+  --resource-group hashtagservice `
+  --yes
+
+# 3. Delete everything (⚠️ also deletes Cosmos DB)
+az group delete --name hashtagservice --yes --no-wait
+```
+
+**Recreate:** Re-run `pwsh ./infra/kafka/deploy.ps1` — Bicep is idempotent, ~2 minutes.
+
+**Or use the cleanup script** (interactive menu or pass `-Target`):
+
+```powershell
+pwsh ./infra/cleanup.ps1                       # interactive menu
+pwsh ./infra/cleanup.ps1 -Target Checkpoints   # reset consumer offsets only
+pwsh ./infra/cleanup.ps1 -Target Messaging     # checkpoints + delete EH namespace (clean restart)
+pwsh ./infra/cleanup.ps1 -Target EventHubs     # delete EH namespace (~$22/month savings)
+pwsh ./infra/cleanup.ps1 -Target All -Force    # delete everything, skip prompts
+```
+
+### Resetting Consumer Checkpoints
+
+If the Event Hubs namespace is **recreated** (or topics are deleted and re-created), the checkpoint blobs still reference old sequence numbers. Consumers will fail with:
+
+> `The supplied sequence number 'NNNN' is invalid. The last sequence number in the system is '-1'`
+
+**Fix:** Delete all checkpoint + ownership blobs so consumers start fresh from the beginning of the stream.
+
+```powershell
+# Reset HashtagPersister checkpoints (persister-checkpoints container)
+az storage blob delete-batch `
+  --account-name hashtsvcchkhp23ei7v `
+  --source persister-checkpoints `
+  --auth-mode login `
+  --pattern "*/checkpoint/*"
+az storage blob delete-batch `
+  --account-name hashtsvcchkhp23ei7v `
+  --source persister-checkpoints `
+  --auth-mode login `
+  --pattern "*/ownership/*"
+
+# Reset HashtagExtractor checkpoints (extractor-checkpoints container)
+az storage blob delete-batch `
+  --account-name hashtsvcchkhp23ei7v `
+  --source extractor-checkpoints `
+  --auth-mode login `
+  --pattern "*/checkpoint/*"
+az storage blob delete-batch `
+  --account-name hashtsvcchkhp23ei7v `
+  --source extractor-checkpoints `
+  --auth-mode login `
+  --pattern "*/ownership/*"
+```
+
+> **When to reset:** After recreating the Event Hubs namespace, after deleting/recreating a topic, or when consumers are stuck on stale offsets. Always restart the consumer services after clearing checkpoints.
 
 ### Scaling Considerations
 
