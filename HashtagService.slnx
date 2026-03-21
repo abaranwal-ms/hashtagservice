@@ -5,4 +5,5 @@
   <Project Path="PostGenerator/PostGenerator.csproj" />
   <Project Path="Shared.Tests/Shared.Tests.csproj" />
   <Project Path="Shared/Shared.csproj" />
+  <Project Path="UserView/UserView.csproj" />
 </Solution>
